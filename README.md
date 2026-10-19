@@ -1,5 +1,7 @@
 # Automação de busca de vagas com n8n
 
+Estava assistindo a alguns vídeos sobre automação de envio de currículos e encontrei o vídeo da [Rafa Ballerini](https://www.youtube.com/@rafaellaballerini), que ensina a montar uma busca de vagas com o n8n. Gostei da ideia, segui o tutorial dela e adaptei para o meu uso: mudei a forma de avaliar as vagas e criei dois workflows novos, um que lê os alertas de vagas do Gmail e outro que acompanha as respostas das candidaturas. Os links do vídeo e dos repositórios dela estão na seção [Créditos](#créditos).
+
 Três workflows de [n8n](https://n8n.io) que automatizam a minha busca por vaga de TI (estágio e júnior): um busca vagas no LinkedIn, outro lê os alertas de vagas que chegam no Gmail e o terceiro acompanha as respostas das candidaturas. Tudo avisa pelo Telegram e usa IA (Groq) onde regra simples não resolve.
 
 Montei para economizar tempo e dinheiro: roda no meu computador, em Docker, e usa o plano gratuito do Groq. A seção [Decisões de custo](#decisões-de-custo) explica o que adaptei para isso.
