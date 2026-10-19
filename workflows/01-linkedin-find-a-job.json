@@ -1,0 +1,487 @@
+{
+  "name": "LinkedIn Automatic Find a Job",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "Run actor and get dataset",
+        "actorSource": "store",
+        "actorId": {
+          "__rl": true,
+          "value": "hKByXkMQaC5Qt9UMN",
+          "mode": "list",
+          "cachedResultName": "Linkedin Jobs Scraper (curious_coder/linkedin-jobs-scraper)",
+          "cachedResultUrl": "https://console.apify.com/actors/hKByXkMQaC5Qt9UMN/input"
+        },
+        "customBody": "{\n  \"keywords\": \"estágio análise de dados\",\n  \"location\": \"Belo Horizonte, Minas Gerais, Brazil\",\n  \"limitPerSource\": 100\n}",
+        "timeout": {},
+        "maxTotalChargeUsd": {}
+      },
+      "type": "@apify/n8n-nodes-apify.apify",
+      "typeVersion": 2,
+      "position": [
+        4992,
+        544
+      ],
+      "id": "ffa8a4bc-8232-42c7-b12a-93e23bc78e7a",
+      "name": "Run an Actor and get dataset"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ====== CONFIGURAÇÃO ======\nconst LIMITE_VAGAS = 20;     // quantas vagas NOVAS vão para a IA por execução (Groq grátis)\nconst DESCRICAO_MAX = 1000;  // caracteres da descrição enviados à IA\n\n// Memória de vagas já avaliadas (dedupe entre execuções).\n// Só é gravada em execução de produção (schedule); em teste manual nada é salvo.\nconst sd = $getWorkflowStaticData('global');\nconst jaVistas = new Set(sd.linkedinVistos || []);\n\n// Tira acentos e deixa minúsculo (estágio -> estagio)\nconst norm = (s) => (s || '').toString().toLowerCase()\n  .normalize('NFD').replace(/[̀-ͯ]/g, '');\n\n// 1. O título precisa ter pelo menos um destes termos (área)\nconst areasFoco = [\n  // dados\n  'dados', 'data', 'analytics', 'bi', 'business intelligence', 'power bi', 'python', 'sql',\n  // suporte / TI geral\n  'suporte', 'service desk', 'help desk', 'helpdesk', 'ti', 'it support',\n  'tecnologia da informacao', 'sistema', 'operacoes de ti',\n  // QA\n  'qa', 'teste', 'tester', 'qualidade de software', 'quality assurance',\n  // desenvolvimento\n  'desenvolvedor', 'desenvolvimento de software', 'developer', 'software', 'programador'\n];\n\n// 2. Descarta pelo título: senioridade e gestão\nconst termosDescarte = [\n  'senior', 'sr', 'pleno', 'especialista', 'ii', 'iii', 'iv',\n  'lead', 'leader', 'lider', 'head', 'staff', 'principal', 'arquiteto',\n  'coordenador', 'gerente', 'manager', 'director', 'diretor', 'supervisor'\n];\n\n// Termos curtos (até 4 letras) só valem como palavra inteira\nconst contem = (titulo, lista) => lista.some(termo => {\n  if (termo.length <= 4) {\n    return new RegExp('(^|[^a-z0-9])' + termo + '([^a-z0-9]|$)').test(titulo);\n  }\n  return titulo.includes(termo);\n});\n\n// Link sem parâmetros de rastreio (?position=...&trackingId=...)\nconst linkLimpo = (u) => (u || '').toString().split('?')[0];\n\n// ID da vaga: campo id do Apify ou o número no final do link\nconst idDaVaga = (j) => {\n  if (j.id) return String(j.id);\n  const m = linkLimpo(j.link || j.url).match(/(\\d{6,})\\/?$/);\n  return m ? m[1] : linkLimpo(j.link || j.url);\n};\n\n// Local padronizado: \"Belo Horizonte, Minas Gerais, Brazil\" -> \"Belo Horizonte, MG\"\nconst localLimpo = (s) => {\n  let t = (s || '').toString().trim();\n  if (/greater belo horizonte/i.test(t)) return 'Belo Horizonte e região';\n  t = t.replace(/,\\s*Brazil$/i, '').replace(/Minas Gerais/i, 'MG');\n  return t || 'Não informado';\n};\n\n// Remove repetidas dentro da mesma execução e as já avaliadas em execuções anteriores\nconst nestaExecucao = new Set();\nconst novas = $input.all().filter(item => {\n  const id = idDaVaga(item.json);\n  if (!id) return false;\n  if (nestaExecucao.has(id) || jaVistas.has(id)) return false;\n  nestaExecucao.add(id);\n  return true;\n});\n\n// Filtro de título (área + senioridade)\nconst vagasFiltradas = novas.filter(item => {\n  const titulo = norm(item.json.title);\n  return contem(titulo, areasFoco) && !contem(titulo, termosDescarte);\n});\n\nreturn vagasFiltradas.slice(0, LIMITE_VAGAS).map(item => {\n  const descricaoCompleta = (item.json.description || item.json.descriptionText || '').toString();\n  return {\n    json: {\n      ...item.json,\n      jobId: idDaVaga(item.json),\n      link: linkLimpo(item.json.link || item.json.url),\n      location: localLimpo(item.json.location),\n      descricaoTamanho: descricaoCompleta.trim().length,\n      description: descricaoCompleta.slice(0, DESCRICAO_MAX)\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5232,
+        544
+      ],
+      "id": "3e156a23-418f-4ae5-a13d-082f84fe520f",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Você é um recrutador de TI. Classifique a vaga abaixo e compare com o perfil do candidato. Use somente as informações do perfil e da vaga. Não invente requisitos, experiências ou habilidades.\n\nPERFIL DO CANDIDATO (única fonte de verdade) — <<PREENCHA COM OS SEUS DADOS>>:\n- Busca: <<tipo de vaga: estágio, júnior...>>. Prioridade 1: <<área principal>>. Prioridade 2: <<áreas secundárias>>.\n- Formação: <<curso, nível e ano de conclusão ou previsão>>.\n- Habilidades comprovadas: <<só o que você realmente sabe usar>>.\n- Em andamento (NÃO conta como habilidade atendida): <<o que está estudando>>.\n- O candidato NÃO tem: <<ferramentas que as vagas costumam pedir e você não tem>>.\n- Projeto: <<seu projeto principal, com as tecnologias usadas>>.\n- Experiência: <<suas experiências reais, sem inventar cargo>>.\n- Local: <<cidade/região e se aceita remoto>>.\n\nDADOS DA VAGA:\nVaga: {{ $json.title }}\nEmpresa: {{ $json.companyName }}\nLocal: {{ $json.location }}\nDescrição: {{ ($json.description || '').slice(0, 1000) }}\n\nCOMO CLASSIFICAR:\n- nivel: \"estagio\", \"trainee\", \"junior\", \"pleno_ou_acima\" ou \"nao_informado\". Use \"pleno_ou_acima\" se a vaga pedir pleno, sênior ou mais de 2 anos de experiência na área.\n- area: \"dados\" (dados, análise, BI, Python), \"suporte_qa_ti\" (suporte, service desk, operações, QA, TI geral), \"desenvolvimento\" ou \"fora_de_ti\".\n- modalidade: \"presencial\", \"hibrido\", \"remoto\" ou \"nao_informado\".\n- descricao_suficiente: false se a descrição estiver vazia, for genérica ou não listar requisitos técnicos.\n- requisitos_atendidos: requisitos técnicos citados NA VAGA que o candidato tem como habilidade comprovada. Nunca coloque nada das listas \"Em andamento\" nem \"NÃO tem\".\n- requisitos_faltantes: requisitos técnicos citados NA VAGA que o candidato não tem. Se a vaga pedir algo da lista \"Em andamento\", escreva \"<item> (em andamento)\". Se a descrição não cita requisitos, deixe a lista vazia.\n- pontos_fortes: até 4 itens do PERFIL que ajudam nessa vaga, sempre escritos com as mesmas palavras do perfil. Não use \"domínio\", \"sólido\" nem \"avançado\".\n- resumo_vaga: no máximo 2 frases sobre o que a vaga faz.\n\nINSTRUÇÕES DE RESPOSTA:\nResponda EXCLUSIVAMENTE em JSON puro, em português, com estas chaves (no máximo 5 itens em cada lista):\n{\n  \"nivel\": \"\",\n  \"area\": \"\",\n  \"modalidade\": \"\",\n  \"descricao_suficiente\": true,\n  \"requisitos_atendidos\": [],\n  \"requisitos_faltantes\": [],\n  \"pontos_fortes\": [],\n  \"resumo_vaga\": \"\"\n}",
+        "needsFallback": true,
+        "messages": {
+          "messageValues": []
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        5712,
+        688
+      ],
+      "id": "6bc0705f-5b5a-4bdb-924a-7f50cb059251",
+      "name": "Basic LLM Chain",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 3,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-20b",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        5712,
+        896
+      ],
+      "id": "22231236-fdf7-42c4-9880-922ec347a4ec",
+      "name": "Groq Chat Model"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Roda uma vez por vaga, dentro do Loop.\n// A IA só classifica; a NOTA é calculada aqui, sempre pela mesma regra.\nconst limpa = (s) => (s || '').toString().replace(/[*_`\\[\\]]/g, '').trim();\nconst limpaLista = (v) => (Array.isArray(v) ? v : (v ? [v] : []))\n  .map(limpa).filter(x => x && x !== '...').slice(0, 5);\n\n// 1. Texto gerado pelo Basic LLM Chain\nlet rawText = ($json.text || '').toString();\nrawText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();\nconst inicio = rawText.indexOf('{');\nconst fim = rawText.lastIndexOf('}');\nif (inicio !== -1 && fim > inicio) rawText = rawText.slice(inicio, fim + 1);\n\nlet ia = null;\ntry { ia = JSON.parse(rawText); } catch (e) { ia = null; }\n\n// 2. Dados originais da vaga que está passando pelo Loop agora\nlet job = {};\ntry { job = $('Loop Over Items').item.json; } catch (e) { job = {}; }\n\n// 3. Cálculo da nota (0 a 100)\n//    Área até 35 + Nível até 25 + Requisitos até 40\nconst PONTOS_AREA  = { dados: 35, suporte_qa_ti: 28, desenvolvimento: 20, fora_de_ti: 0 };\nconst PONTOS_NIVEL = { estagio: 25, trainee: 25, junior: 20, nao_informado: 12, pleno_ou_acima: 0 };\nconst NOME_NIVEL   = { estagio: 'estágio', trainee: 'trainee', junior: 'júnior', nao_informado: 'nível não informado', pleno_ou_acima: 'pleno ou acima' };\nconst NOME_AREA    = { dados: 'dados', suporte_qa_ti: 'suporte/QA/TI', desenvolvimento: 'desenvolvimento', fora_de_ti: 'fora de TI' };\n\n// Belo Horizonte e região metropolitana\nconst RMBH = ['belo horizonte', 'contagem', 'betim', 'nova lima', 'vespasiano', 'lagoa santa',\n  'sabara', 'santa luzia', 'ribeirao das neves', 'ibirite', 'confins', 'pedro leopoldo', 'brumadinho'];\nconst norm = (s) => (s || '').toString().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');\n\nlet score = 0, nivel = '', area = '', avisos = [], erroIA = false;\nlet atendidos = [], faltantes = [], pontos = [], resumo = '';\n\nif (!ia) {\n  erroIA = true;\n  resumo = 'Erro ao processar a resposta da IA';\n} else {\n  nivel = PONTOS_NIVEL[ia.nivel] !== undefined ? ia.nivel : 'nao_informado';\n  area = PONTOS_AREA[ia.area] !== undefined ? ia.area : 'fora_de_ti';\n  atendidos = limpaLista(ia.requisitos_atendidos);\n  faltantes = limpaLista(ia.requisitos_faltantes);\n  pontos = limpaLista(ia.pontos_fortes).slice(0, 4);\n  resumo = limpa(ia.resumo_vaga);\n\n  const totalReq = atendidos.length + faltantes.length;\n  const ptsReq = totalReq === 0 ? 20 : Math.round(40 * atendidos.length / totalReq);\n  score = PONTOS_AREA[area] + PONTOS_NIVEL[nivel] + ptsReq;\n\n  // Tetos\n  const local = norm(job.location);\n  const modalidade = (ia.modalidade || '').toString();\n  const naRegiao = RMBH.some(c => local.includes(c));\n  const localGenerico = !local || local === 'nao informado' || local === 'brazil' || local === 'brasil';\n  const localOk = naRegiao || modalidade === 'remoto' || localGenerico;\n  const descricaoCurta = (job.descricaoTamanho || 0) < 400 || ia.descricao_suficiente === false;\n\n  if (nivel === 'pleno_ou_acima') { score = Math.min(score, 40); avisos.push('Pede pleno/sênior ou mais de 2 anos de experiência'); }\n  if (area === 'fora_de_ti')     { score = Math.min(score, 30); avisos.push('Vaga fora de TI'); }\n  if (!localOk)                  { score = Math.min(score, 30); avisos.push('Presencial/híbrido fora de BH e região'); }\n  if (descricaoCurta)            { score = Math.min(score, 70); avisos.push('Descrição curta: nota limitada a 70 (avaliada pelo título)'); }\n}\n\n// 4. Marca a vaga como avaliada (dedupe). Se a IA falhou, NÃO marca: tenta de novo amanhã.\nif (!erroIA && job.jobId) {\n  const sd = $getWorkflowStaticData('global');\n  const lista = sd.linkedinVistos || [];\n  if (!lista.includes(job.jobId)) lista.push(job.jobId);\n  sd.linkedinVistos = lista.slice(-5000);\n}\n\nconst totalReq = atendidos.length + faltantes.length;\nreturn {\n  json: {\n    jobId: job.jobId || '',\n    title: limpa(job.title) || 'Título não informado',\n    company: limpa(job.companyName) || 'Empresa não informada',\n    location: limpa(job.location) || 'Não informado',\n    url: job.link || job.url || '',\n    score,\n    nivel: NOME_NIVEL[nivel] || '',\n    area: NOME_AREA[area] || '',\n    requisitosResumo: totalReq ? `${atendidos.length}/${totalReq} requisitos` : 'requisitos não listados',\n    avisos,\n    erroIA,\n    pontos_fortes: pontos,\n    requisitos_atendidos: atendidos,\n    requisitos_faltantes: faltantes,\n    resumo_vaga: resumo\n  }\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6016,
+        688
+      ],
+      "id": "6b9e783c-1d7a-40a7-8577-e87047fcb473",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "3a99e95a-1b52-4a78-a031-9353272dae92",
+              "leftValue": "={{ $json.score }}",
+              "rightValue": 60,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        6256,
+        688
+      ],
+      "id": "c71cd2c3-9dbd-49ed-998d-7c30b9fb937a",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Vaga: {{ $json.title }} na empresa {{ $json.company }}\nNível: {{ $json.nivel }} | Área: {{ $json.area }}\nResumo da vaga: {{ $json.resumo_vaga }}\nRequisitos da vaga que o candidato atende: {{ ($json.requisitos_atendidos || []).join(', ') || 'não listados' }}\nPontos fortes do perfil para essa vaga: {{ ($json.pontos_fortes || []).join(', ') }}",
+        "needsFallback": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "Você escreve o MEIO de cartas de apresentação curtas, em português, para candidaturas a estágio ou vaga júnior em TI. Escreva em primeira pessoa, como o candidato.\n\nA saudação, a apresentação (\"Sou SEU NOME, SUA FORMAÇÃO\") e a assinatura JÁ SÃO ADICIONADAS AUTOMATICAMENTE. Não escreva saudação, não se apresente, não cite nome, formação, período da faculdade nem assinatura.\n\nDADOS DO CANDIDATO (use somente estas informações) — <<PREENCHA>>:\n- Habilidades comprovadas: <<suas habilidades reais>>\n- Projeto: <<seu projeto principal>>\n- Experiência: <<suas experiências reais>>\n- Em andamento: <<o que está estudando; só pode ser citado como \"estudando ...\">>\n\nREGRAS:\n- Não invente experiência, ferramenta, cargo ou resultado. Proibido dizer que criou dashboards, KPIs, automações de relatórios, modelos de dados, testes de software ou que tem domínio, experiência sólida ou conhecimento avançado.\n- Não diga que já atuou como desenvolvedor ou analista de dados.\n- Escolha no máximo 2 itens dos dados acima que sejam relevantes para a vaga. Cite o projeto apenas se a vaga envolver a mesma área dele.\n- Feche com uma frase sobre como pode contribuir nas atividades da vaga, sem elogiar a empresa.\n- 2 a 3 frases, no máximo 70 palavras.\n- Texto puro em um único parágrafo: sem markdown, sem asteriscos, sem listas."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        6512,
+        544
+      ],
+      "id": "15210048-7293-4543-b0f8-5242b68206f2",
+      "name": "Basic LLM Chain1",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 3,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-120b",
+        "options": {
+          "temperature": 0.3
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        6512,
+        752
+      ],
+      "id": "ea2d9ace-f5f4-438c-9943-f32d328d884e",
+      "name": "Groq Chat Model1"
+    },
+    {
+      "parameters": {
+        "chatId": "SEU_CHAT_ID_DO_TELEGRAM",
+        "text": "={{ $json.mensagem }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        6944,
+        544
+      ],
+      "id": "5618ae30-eff2-4c4d-99eb-f577d01de70a",
+      "name": "Send a text message",
+      "webhookId": "9eb9aa09-2583-4725-91da-3d05545a6195",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 15
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        4768,
+        544
+      ],
+      "id": "8c598e32-0141-487f-907f-21f9ba40ba27",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        5472,
+        544
+      ],
+      "id": "a718c113-df17-42fe-a7f9-40472c5dc7da",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "amount": 30
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        7168,
+        688
+      ],
+      "id": "74efc3d9-92ca-403f-a910-92de94cf2a65",
+      "name": "Wait",
+      "webhookId": "cf51db84-d0d5-46bc-90ef-1e9d0a320e18"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Monta a mensagem final do Telegram (HTML) com carta, bullets e link limpo.\nconst v = $('Code in JavaScript1').item.json;\n\nconst esc = (s) => (s || '').toString()\n  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n\nconst bullets = (lista, vazio) => (lista && lista.length)\n  ? lista.map(x => '• ' + esc(x)).join('\\n')\n  : '• ' + vazio;\n\n// Carta: a IA escreve só o meio; saudação, apresentação e assinatura são fixas\nlet corpo = ($json.text || '').toString()\n  .replace(/[*_`#]/g, '')\n  .split('\\n')\n  .filter(l => !/^\\s*(olá|ola|prezad|atenciosamente|seu nome|github\\.com)/i.test(l))\n  .join(' ')\n  .replace(/^\\s*(sou|me chamo|meu nome é)\\s+seu nome[^.]*\\.\\s*/i, '')\n  .replace(/\\s+/g, ' ')\n  .trim();\n\nconst carta = corpo\n  ? 'Olá,\\n\\nSou SEU NOME, SUA FORMAÇÃO (ex.: curso e ano). '\n    + corpo\n    + '\\n\\nAtenciosamente,\\nSEU NOME\\ngithub.com/SEU-USUARIO'\n  : '(não foi possível gerar a carta desta vez)';\n\nconst cor = v.score >= 80 ? '🟢' : '🟡';\nconst detalhes = [v.nivel, v.area, v.requisitosResumo].filter(Boolean).join(' · ');\nconst avisos = (v.avisos || []).map(a => '⚠️ <i>' + esc(a) + '</i>').join('\\n');\n\nconst linhas = [\n  '🎯 <b>NOVA VAGA COMPATÍVEL</b>',\n  '📌 <b>Vaga:</b> ' + esc(v.title),\n  '🏢 <b>Empresa:</b> ' + esc(v.company),\n  '📍 <b>Local:</b> ' + esc(v.location),\n  cor + ' <b>Score:</b> ' + v.score + '/100  <i>(' + esc(detalhes) + ')</i>',\n];\nif (avisos) linhas.push(avisos);\nlinhas.push(\n  '',\n  '💡 <b>Resumo:</b> ' + esc(v.resumo_vaga || 'Sem resumo.'),\n  '',\n  '✅ <b>Pontos fortes:</b>',\n  bullets(v.pontos_fortes, 'Nenhum identificado'),\n  '',\n  '❗ <b>Requisitos faltantes:</b>',\n  bullets(v.requisitos_faltantes, 'Nenhum identificado na descrição'),\n  '',\n  '✉️ <b>Sugestão de carta:</b>',\n  '',\n  esc(carta),\n  '',\n  '🔗 <a href=\"' + esc(v.url) + '\">Abrir a vaga no LinkedIn</a>'\n);\n\nreturn { json: { mensagem: linhas.join('\\n') } };\n"
+      },
+      "id": "cb816569-9805-44b7-91ba-a10c5397805f",
+      "name": "Montar mensagem",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6720,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-120b",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "6ef4054a-1086-4591-8f32-38d29451b513",
+      "name": "Groq Reserva Score",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        5840,
+        896
+      ]
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-20b",
+        "options": {
+          "temperature": 0.3
+        }
+      },
+      "id": "68453cc2-9b8a-447b-b434-4314aa2786e8",
+      "name": "Groq Reserva Carta",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        6640,
+        752
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Créditos\n\nEste workflow parte do tutorial de **Rafa Ballerini** (@rafaellaballerini):\n- Vídeo: https://www.youtube.com/watch?v=sq8ThaXkp7k\n- Códigos e textos: https://github.com/rafaballerini/CodigosBuscaDeEmpregoN8N\n- Como adicionar as credenciais: https://github.com/rafaballerini/CredenciaisVagasDeEmprego\n\nAdaptações: nota calculada por regra, memória entre execuções (sem vaga repetida), modelos reserva no Groq e carta com dados fixos.\n\n**Antes de usar:** preencha o PERFIL nos prompts, o NOME/GitHub no nó 'Montar mensagem', o chat ID do Telegram e selecione as suas credenciais.",
+        "height": 400,
+        "width": 460
+      },
+      "id": "9a7c1e52-3d4b-4f60-8a11-6c2e5b7d9f03",
+      "name": "Créditos",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        4416,
+        96
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Run an Actor and get dataset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run an Actor and get dataset": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain1": {
+      "main": [
+        [
+          {
+            "node": "Montar mensagem",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send a text message": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar mensagem": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Reserva Score": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Groq Reserva Carta": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain1",
+            "type": "ai_languageModel",
+            "index": 1
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timezone": "America/Sao_Paulo"
+  },
+  "meta": {},
+  "nodeGroups": [],
+  "tags": []
+}

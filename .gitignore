@@ -1,0 +1,17 @@
+# Dados privados (caso a pasta privada seja colocada dentro do repositório por engano)
+privado/
+*-privado/
+sanitize.config.json
+
+# Segredos e ambiente
+.env
+.env.*
+*.pem
+
+# Sistema / editor
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+.vscode/
+.idea/

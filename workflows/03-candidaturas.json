@@ -1,0 +1,1077 @@
+{
+  "name": "Candidaturas",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 9,14,20 * * *"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        5552,
+        2624
+      ],
+      "id": "5dff2273-922d-4123-b7ad-2f52070d84f7",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "path": "candidaturas-backfill",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        5552,
+        2848
+      ],
+      "id": "63937da4-259d-46d6-9462-35bf26870b12",
+      "name": "Webhook Backfill",
+      "webhookId": "8550a39f-4230-468a-946c-9247bbc88f7b"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== MONTAR BUSCA =====\n// Define o que será buscado no Gmail. Dois caminhos chegam aqui:\n//  - Schedule Trigger (diário): últimos 3 dias\n//  - Webhook (backfill manual): ?dias=90  ou  ?inicio=2026/07/01&fim=2026/10/16\n// Não usa rótulo: os emails já vistos são controlados pela lista \"vistos\" do nó seguinte.\n\n// ====== CONFIGURAÇÃO ======\nconst DIAS_DIARIO = 3;\nconst DIAS_BACKFILL_PADRAO = 90;\n// Etiqueta do Gmail onde já caem seus emails de trabalho (filtro seu). Rede de segurança extra: tudo com essa etiqueta entra na busca.\n// Deixe '' para desligar.\nconst ETIQUETA_TRABALHO = 'Trabalho';\n// Plataformas e empresas que mandam resposta de candidatura.\n// (LinkedIn fica de fora: os alertas de vagas dele são pesados e já são tratados pelo outro workflow;\n//  as confirmações dele entram pelo assunto 'candidatura' na rede de segurança abaixo)\nconst REMETENTES = [\n  'solides.com', 'gupy.com.br', 'ses-mail.inhire.app', 'mindsight.com.br', 'mg.mindsight.com.br',\n  'indeedapply@indeed.com', 'pandape.com.br',\n  'vagas.com.br', 'catho.com.br', 'kenoby.com', 'greenhouse.io', 'lever.co'\n];\n// Rede de segurança: qualquer remetente cujo assunto fale de candidatura\nconst ASSUNTOS = ['candidatura', '\"processo seletivo\"', '\"próxima etapa\"', 'entrevista', '\"recebemos sua inscrição\"', '\"currículo recebido\"',\n  'feedback', 'retorno', '\"sua participação\"', '\"programa de estágio\"', 'trainee'];\n// Remetentes que nunca interessam (alertas de vagas já são tratados pelo outro workflow)\nconst IGNORAR = [\n  'noreply-accounts@google.com', 'inbound.gupy.com.br', 'jobalerts-noreply@linkedin.com',\n  'noreply@glassdoor.com', 'donotreply@jobalert.indeed.com', 'donotreply@match.indeed.com',\n  'newsletters-noreply@linkedin.com', 'invitations@linkedin.com', 'messages-noreply@linkedin.com', 'notifications-noreply@linkedin.com'\n];\n// ==========================\n\nconst entrada = $input.first().json || {};\nconst query = entrada.query || {};\nconst veioDoWebhook = !!(entrada.query || entrada.headers);\n\nlet periodo = `newer_than:${DIAS_DIARIO}d`;\nlet modo = 'diario';\nif (veioDoWebhook) {\n  modo = 'backfill';\n  const ok = (d) => /^\\d{4}\\/\\d{2}\\/\\d{2}$/.test(d || '');\n  if (ok(query.inicio) || ok(query.fim)) {\n    periodo = [ok(query.inicio) ? `after:${query.inicio}` : '', ok(query.fim) ? `before:${query.fim}` : ''].filter(Boolean).join(' ');\n  } else {\n    const dias = Math.min(Math.max(parseInt(query.dias, 10) || DIAS_BACKFILL_PADRAO, 1), 400);\n    periodo = `newer_than:${dias}d`;\n  }\n}\n\nconst porEtiqueta = ETIQUETA_TRABALHO ? ` OR label:\"${ETIQUETA_TRABALHO}\"` : '';\n// Do LinkedIn (jobs-noreply) só interessam os emails de candidatura; os alertas de vagas são pesados e ficam com o outro workflow.\nconst q = `(from:(${REMETENTES.join(' OR ')}) OR subject:(${ASSUNTOS.join(' OR ')})${porEtiqueta}) -from:(${IGNORAR.join(' OR ')}) -in:sent -label:vagas-processado -(from:jobs-noreply@linkedin.com -subject:candidatura) ${periodo}`;\nreturn [{ json: { q, modo, periodo } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5808,
+        2704
+      ],
+      "id": "2e3711d1-cdd7-4c39-ab5e-6fde314c457f",
+      "name": "Montar busca"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "simple": false,
+        "filters": {
+          "includeSpamTrash": true,
+          "q": "={{ $json.q }}"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        6064,
+        2704
+      ],
+      "id": "4b83b995-35d0-4b8f-be7a-20060baba3c8",
+      "name": "Buscar emails",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "webhookId": "a7a622df-d75e-4dab-a9e8-487608aa64b7",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "SEU_CHAT_ID_DO_TELEGRAM",
+        "text": "=⚠️ *Candidaturas não conseguiu ler o Gmail.*\nMotivo: {{ (typeof $json.error === 'string' ? $json.error : ($json.error && $json.error.message) || 'erro desconhecido').toString().replace(/[*_`\\[\\]]/g, '').slice(0, 300) }}\n\nSe o app do Google ainda estiver em modo Teste, o acesso expira a cada 7 dias: abra a credencial do Gmail no n8n e clique em *Sign in with Google* de novo.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        6320,
+        2928
+      ],
+      "id": "32423964-6716-4514-b62e-68a943685847",
+      "name": "Aviso erro Gmail",
+      "webhookId": "53898a38-b86b-4751-a266-d1cfbefa7e58",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== CLASSIFICAR EMAILS DE CANDIDATURA =====\n// Recebe os emails do Gmail e decide, só com regras (sem IA), de que tipo é cada um:\n// confirmacao | visualizada | etapa | entrevista | oferta | recusa | cancelamento | outro | ruido\n// A IA entra depois apenas para extrair empresa, vaga e prazo.\n\n// ====== CONFIGURAÇÃO ======\nconst LIMITE_POR_RODADA = 100;   // máximo de emails analisados pela IA por execução\nconst LIMITE_TESTE = 5;          // no teste manual só processa 5\nconst MAX_VISTOS = 4000;         // quantos IDs de email lembrar\nconst TEXTO_MAX = 1500;          // quanto do corpo vai para a IA\nconst PLATAFORMAS = [\n  ['solides.com', 'Solides'], ['gupy.com.br', 'Gupy'], ['inhire.app', 'Inhire'], ['mindsight.com.br', 'Mindsight'],\n  ['indeed.com', 'Indeed'], ['linkedin.com', 'LinkedIn'], ['pandape.com.br', 'Pandapé'], \n  ['vagas.com.br', 'Vagas.com'], ['catho.com.br', 'Catho'], ['kenoby.com', 'Kenoby'], ['greenhouse.io', 'Greenhouse'], ['lever.co', 'Lever']\n];\n// ==========================\n\nconst norm = (s) => (s || '').toString().toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g, '');\nconst decode = (s) => s.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&#39;/g, \"'\");\nfunction htmlParaTexto(html) {\n  return decode((html || '')\n    .replace(/<(script|style)[\\s\\S]*?<\\/\\1>/gi, '')\n    .replace(/<br\\s*\\/?>|<\\/(p|div|tr|li|h\\d|table|td)>/gi, '\\n')\n    .replace(/<[^>]+>/g, ' '))\n    .replace(/[ \\t]+/g, ' ').replace(/\\n\\s*\\n+/g, '\\n\\n');\n}\nconst limpaCorpo = (t) => t\n  .replace(/\\[([^\\]]*)\\]\\(https?:[^)]*\\)/g, '$1')   // links em markdown\n  .replace(/https?:\\/\\/\\S+/g, '')                    // urls soltas\n  .replace(/[\\u034f\\u00ad\\u200b-\\u200d]/g, '')                 // caracteres invisíveis\n  .replace(/\\s+/g, ' ').trim();\n\nconst RUIDO = /codigo de confirmacao|redefinicao de senha|recuperacao de senha|cadastramento de curriculo|foram reaproveitados|compartilhou alguns dados|confirme seu (e-?mail|cadastro)|boletim|newsletter|extrato mensal|ative sua conta|bem[- ]vindo ao site|finalizado com sucesso|recebemos suas respostas/;\nconst RE_CANCEL = /(candidatura|inscricao) (foi )?cancelad|cancelamento de candidatura/;\nconst RE_RECUSA = /optamos por (nao )?seguir|nao (seguiremos|vamos seguir|sera possivel seguir|foi selecionad|avancou|avancara)|nao atende(u)? ao perfil|infelizmente|outro (perfil|candidato)|encerr(amos|ado|ou) (o )?(seu )?processo|agradecimento de participacao|processo seletivo (foi )?encerrado/;\nconst RE_OFERTA = /(voce foi|foi) (aprovad|selecionad)[oa]|proposta de (emprego|trabalho|estagio)|carta[- ]oferta|oferta de (emprego|trabalho|estagio)|gostariamos de (te |lhe )?(contratar|ter voce)|parabens[^.]{0,40}(aprovad|contratad)/;\nconst RE_ENTREVISTA_ASSUNTO = /entrevista/;\nconst RE_ENTREVISTA_CORPO = /(entrevista (com|online|virtual|agendada|marcada)|agende (sua|a) entrevista|convite para (a |uma )?entrevista|convidamos (voce )?para (uma )?(entrevista|conversa)|agendamento de entrevista|sua entrevista|link da (entrevista|reuniao))/;\nconst RE_ETAPA_ASSUNTO = /proxima etapa|teste|desafio|case tecnico|fit cultural|avaliacao|mapeamento|dinamica|prova online/;\nconst RE_ETAPA_CORPO = /(realize|responda|acesse|inicie|iniciar|faca) (o|seu|sua|os) (teste|desafio|avaliacao)|chegou a uma etapa|proxima etapa|voce (foi )?avancou para/;\nconst RE_CONFIRMA = /candidatura (foi )?(efetuada|enviada|recebida|confirmada|registrada)|recebemos (a |sua )?(sua )?(candidatura|inscricao|curriculo)|inscricao (confirmada|recebida)|confirmacao de candidatura|curriculo foi recebido|inscricao via indeed|obrigad[oa] pela sua (recente )?candidatura|mantenha-se informado sobre sua candidatura|participando do processo seletivo|candidatura (foi )?enviada a/;\nconst RE_VISUALIZADA = /(candidatura|perfil|curriculo) (foi )?(visualizad|vist[ao])|visualizou (sua|o seu) (candidatura|perfil)/;\n\nfunction detectar(assunto, corpo) {\n  const a = norm(assunto);\n  const t = norm(assunto + ' \\n ' + corpo.slice(0, 1800));\n  if (RUIDO.test(t)) return 'ruido';\n  if (RE_CANCEL.test(t)) return 'cancelamento';\n  if (RE_RECUSA.test(t) || a.trim() === 'feedback') return 'recusa';\n  if (RE_OFERTA.test(t)) return 'oferta';\n  if (RE_ENTREVISTA_ASSUNTO.test(a) || RE_ENTREVISTA_CORPO.test(t)) return 'entrevista';\n  if (RE_ETAPA_ASSUNTO.test(a) || RE_ETAPA_CORPO.test(t)) return 'etapa';\n  if (RE_CONFIRMA.test(t)) return 'confirmacao';\n  if (RE_VISUALIZADA.test(t)) return 'visualizada';\n  return 'outro';\n}\n\nfunction origem(de) {\n  const dom = (de.split('@')[1] || '').replace(/[>\\s]/g, '');\n  for (const [d, nome] of PLATAFORMAS) if (dom === d || dom.endsWith('.' + d)) return { plataforma: nome, dominio: dom };\n  return { plataforma: 'Direto', dominio: dom };\n}\n\nconst sd = $getWorkflowStaticData('global');\nsd.vistos = sd.vistos || [];\nsd.apps = sd.apps || {};\nconst vistos = new Set(sd.vistos);\nconst producao = $execution.mode === 'production';\nlet modo = 'diario';\ntry { modo = $('Montar busca').first().json.modo || 'diario'; } catch (e) {}\n\nconst run = { modo, inicio: new Date().toISOString(), lidos: 0, novos: 0, ignorados: 0, adiados: 0, porTipo: {}, confirmacoes: [], suprimidos: 0, alertas: 0, novasApps: 0 };\n\nconst candidatos = [];\nfor (const it of $input.all()) {\n  const j = it.json || {};\n  if (!j.id && !j.text && !j.html) continue;     // item vazio (busca sem resultado)\n  run.lidos++;\n  if (vistos.has(j.id)) continue;\n  const de = (typeof j.from === 'string' ? j.from : (j.from && (j.from.text || (j.from.value && j.from.value[0] && j.from.value[0].address))) || '').toLowerCase();\n  const assunto = (j.subject || '').toString();\n  const ehIndeed = /@([a-z0-9-]+\\.)*indeed\\.com/.test(de);   // no Indeed o nome da empresa só vem no HTML, não no texto simples\n  const corpoBruto = (!ehIndeed && j.text && j.text.length > 40) ? j.text : (htmlParaTexto(j.html || '') || j.text || '');\n  const corpo = limpaCorpo(corpoBruto);\n  const tipo = detectar(assunto, corpo);\n  const data = j.date || (j.internalDate ? new Date(Number(j.internalDate)).toISOString() : new Date().toISOString());\n  if (tipo === 'ruido') { run.ignorados++; sd.vistos.push(j.id); continue; }\n  const { plataforma, dominio } = origem(de);\n  // dica por regra (plano B se a IA falhar): Indeed escreve \"Os seguintes itens foram enviados para <Empresa>. Boa sorte\"\n  let dicaEmpresa = '';\n  const mi = corpo.match(/enviados? para\\s+(.{2,80}?)\\.\\s*(?:boa sorte|$)/i);\n  if (ehIndeed && mi) dicaEmpresa = mi[1].trim();\n  candidatos.push({\n    emailId: j.id, threadId: j.threadId || j.id, remetente: de, dominio, plataforma,\n    assunto: assunto.replace(/\\s+/g, ' ').trim(), data: new Date(data).toISOString(), tipoRegex: tipo,\n    dicaEmpresa,\n    texto: corpo.slice(0, TEXTO_MAX),\n    link: `https://mail.google.com/mail/u/0/#all/${j.threadId || j.id}`\n  });\n}\n\n// mais recentes primeiro para escolher quem entra na rodada; depois processa do mais antigo ao mais novo\ncandidatos.sort((a, b) => b.data.localeCompare(a.data));\nconst limite = producao ? LIMITE_POR_RODADA : LIMITE_TESTE;\nrun.adiados = Math.max(0, candidatos.length - limite);\nconst escolhidos = candidatos.slice(0, limite).sort((a, b) => a.data.localeCompare(b.data));\nrun.novos = escolhidos.length;\n\nsd.run = run;\nif (!escolhidos.length) return [{ json: { _vazio: true } }];\nreturn escolhidos.map(c => ({ json: c }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6320,
+        2704
+      ],
+      "id": "230a73eb-49b4-43a9-8b22-95b4f980f628",
+      "name": "Classificar emails"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "6bc2d397-0776-49fe-b61d-28ed8ec25415",
+              "leftValue": "={{ !!$json._vazio }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        6592,
+        2704
+      ],
+      "id": "48ed087d-6cdc-4305-af5d-b80fb6e93bae",
+      "name": "Tem email?"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        6848,
+        2704
+      ],
+      "id": "4336aab1-7793-4c47-993f-9aa7e3fb57c5",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Você lê emails de acompanhamento de candidaturas a vagas e extrai fatos. Responda SOMENTE com um JSON válido, sem markdown e sem texto extra.\n\nEmail recebido via {{ $json.plataforma }} (remetente: {{ $json.remetente }}).\nAssunto: {{ $json.assunto }}\nCorpo: {{ $json.texto }}\n\nREGRAS:\n- empresa: a empresa que abriu a vaga. NÃO use o nome da plataforma (Gupy, Solides, Inhire, Mindsight, Indeed, LinkedIn, Pandapé). Se a empresa não aparecer no email, use \"\".\n- vaga: o título da vaga, sem códigos internos quando possível. Se não aparecer, use \"\".\n- prazo: data limite ou data/hora marcada para um teste ou entrevista, somente se estiver escrita no email; senão \"\".\n- tipo_sugerido: um destes: confirmacao, visualizada, etapa, entrevista, oferta, recusa, cancelamento, outro.\n- motivo: uma frase curta (até 120 caracteres) com o motivo da recusa ou do cancelamento, ou o que a etapa pede; senão \"\".\n- Não invente nada que não esteja no email.\n\nFORMATO:\n{\"empresa\":\"\",\"vaga\":\"\",\"prazo\":\"\",\"tipo_sugerido\":\"\",\"motivo\":\"\"}",
+        "messages": {
+          "messageValues": []
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        7104,
+        2704
+      ],
+      "id": "924d012b-b593-4035-97c8-cadb8002160b",
+      "name": "Basic LLM Chain",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 3,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-20b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        7104,
+        2928
+      ],
+      "id": "765598ca-8479-48ba-9dea-32f2247e7e7b",
+      "name": "Groq Chat Model"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "eac727ea-bb02-408b-b7f6-c14d544e036a",
+              "leftValue": "={{ !!($json.text && String($json.text).trim().length > 5) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        7360,
+        2704
+      ],
+      "id": "ca6fa8a6-655a-4110-b64b-a52115c92006",
+      "name": "IA respondeu?"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Você lê emails de acompanhamento de candidaturas a vagas e extrai fatos. Responda SOMENTE com um JSON válido, sem markdown e sem texto extra.\n\nEmail recebido via {{ $('Loop Over Items').item.json.plataforma }} (remetente: {{ $('Loop Over Items').item.json.remetente }}).\nAssunto: {{ $('Loop Over Items').item.json.assunto }}\nCorpo: {{ $('Loop Over Items').item.json.texto }}\n\nREGRAS:\n- empresa: a empresa que abriu a vaga. NÃO use o nome da plataforma (Gupy, Solides, Inhire, Mindsight, Indeed, LinkedIn, Pandapé). Se a empresa não aparecer no email, use \"\".\n- vaga: o título da vaga, sem códigos internos quando possível. Se não aparecer, use \"\".\n- prazo: data limite ou data/hora marcada para um teste ou entrevista, somente se estiver escrita no email; senão \"\".\n- tipo_sugerido: um destes: confirmacao, visualizada, etapa, entrevista, oferta, recusa, cancelamento, outro.\n- motivo: uma frase curta (até 120 caracteres) com o motivo da recusa ou do cancelamento, ou o que a etapa pede; senão \"\".\n- Não invente nada que não esteja no email.\n\nFORMATO:\n{\"empresa\":\"\",\"vaga\":\"\",\"prazo\":\"\",\"tipo_sugerido\":\"\",\"motivo\":\"\"}",
+        "messages": {
+          "messageValues": []
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        7360,
+        2928
+      ],
+      "id": "c6bf7581-42b7-40a5-a436-c37ebf8f6415",
+      "name": "Basic LLM Chain reserva",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 2,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-120b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        7360,
+        3152
+      ],
+      "id": "70eddbea-ec20-4fa6-aa99-2f59c31e3187",
+      "name": "Groq Chat Model reserva"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ===== ATUALIZAR PAINEL =====\n// Junta o que as regras decidiram (tipo do email) com o que a IA extraiu (empresa, vaga, prazo),\n// atualiza o status da candidatura e decide se vale avisar no Telegram.\n// Roda uma vez por email (modo \"Run once for each item\").\n\n// ====== CONFIGURAÇÃO ======\nconst MAX_VISTOS = 4000;\nconst DIAS_ALERTA_RECENTE = 3;    // emails mais antigos que isso não geram alerta individual (entram só no resumo)\nconst PAINEL_URL = 'http://localhost:5678/webhook/candidaturas';\n// ==========================\n\nconst norm = (s) => (s || '').toString().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');\nconst limpa = (s) => (s == null ? '' : s).toString().replace(/[*_`\\[\\]]/g, '').replace(/\\s+/g, ' ').trim();\nconst TIPOS = ['confirmacao', 'visualizada', 'etapa', 'entrevista', 'oferta', 'recusa', 'cancelamento'];\nconst STATUS_DO_TIPO = { confirmacao: 'enviada', visualizada: 'em_analise', etapa: 'etapa', entrevista: 'entrevista', oferta: 'oferta', recusa: 'recusada', cancelamento: 'cancelada' };\nconst RANK = { enviada: 1, em_analise: 2, etapa: 3, entrevista: 4, oferta: 5, recusada: 9, cancelada: 9 };\nconst TERMINAL = new Set(['recusada', 'cancelada']);\nconst ALERTAS = {\n  entrevista: '🗓️ *CONVITE PARA ENTREVISTA*',\n  etapa: '📝 *PRÓXIMA ETAPA / TESTE*',\n  oferta: '🎉 *PROPOSTA / APROVAÇÃO*',\n  recusa: '❌ *NÃO SEGUIRAM COM A CANDIDATURA*',\n  cancelamento: '🚫 *CANDIDATURA CANCELADA*'\n};\nconst NOME_PLATAFORMA = /^(gupy|solides|inhire|mindsight|indeed|linkedin|pandape|vagas\\.?com|catho|kenoby|greenhouse|lever|sólides)$/;\n\nconst j = $('Loop Over Items').item.json;\nconst sd = $getWorkflowStaticData('global');\nsd.apps = sd.apps || {}; sd.vistos = sd.vistos || [];\nsd.run = sd.run || { porTipo: {}, confirmacoes: [], suprimidos: 0, alertas: 0, novasApps: 0, ignorados: 0 };\nconst run = sd.run;\n\n// 1. Resposta da IA (tolerante a aspas soltas / vírgula sobrando)\nlet raw = ($json.text || '').replace(/```json/gi, '').replace(/```/g, '').trim();\nconst i0 = raw.indexOf('{'), i1 = raw.lastIndexOf('}');\nif (i0 !== -1 && i1 > i0) raw = raw.slice(i0, i1 + 1);\nconst tenta = (t) => { try { return JSON.parse(t); } catch (e) { return null; } };\nfunction salvar(t) {\n  const o = tenta(t) || tenta(t.replace(/[“”]/g, '\"').replace(/,\\s*([}\\]])/g, '$1'));\n  if (o) return o;\n  const str = (k) => { const m = t.match(new RegExp('\"' + k + '\"\\\\s*:\\\\s*\"([^\"]*)\"')); return m ? m[1] : ''; };\n  if (!str('empresa') && !str('vaga') && !str('tipo_sugerido')) return null;\n  return { empresa: str('empresa'), vaga: str('vaga'), prazo: str('prazo'), tipo_sugerido: str('tipo_sugerido'), motivo: str('motivo') };\n}\nconst ai = salvar(raw) || {};\nconst erroIA = !Object.keys(ai).length;\n\n// 2. Empresa e vaga (com plano B quando a IA falha ou devolve o nome da plataforma)\nconst nomeDoDominio = () => {\n  const partes = (j.dominio || '').split('.').filter(Boolean);\n  const base = partes.length > 2 && ['com', 'net', 'org'].includes(partes[partes.length - 2]) ? partes[partes.length - 3] : (partes[partes.length - 2] || partes[0] || '');\n  return base ? base.charAt(0).toUpperCase() + base.slice(1) : 'Empresa não identificada';\n};\nlet empresa = limpa(ai.empresa);\nif (!empresa || NOME_PLATAFORMA.test(norm(empresa)) || /^(null|n\\/?a|desconhecid)/.test(norm(empresa))) {\n  empresa = j.dicaEmpresa ? j.dicaEmpresa : (j.plataforma === 'Direto' ? nomeDoDominio() : 'Empresa não identificada');\n}\nlet vaga = limpa(ai.vaga);\nif (/^(null|n\\/?a)$/i.test(vaga)) vaga = '';\n// plano B: só aproveita o assunto quando ele tem formato conhecido (Indeed / Solides); senão deixa em branco\nif (!vaga) { const m = (j.assunto || '').match(/^(?:inscri[çc][ãa]o via indeed:|candidatura efetuada em)\\s*(.+)$/i); if (m) vaga = limpa(m[1]).slice(0, 120); }\nconst nomeVaga = (a) => a.vaga || 'Vaga não informada';\nconst prazo = /^(null|n\\/?a)?$/i.test(limpa(ai.prazo)) ? '' : limpa(ai.prazo);\nconst motivo = limpa(ai.motivo).slice(0, 200);\n\n// 3. Tipo final: as regras mandam; a IA só desempata quando as regras não reconheceram\nlet tipo = j.tipoRegex;\nif (tipo === 'outro') { const s = norm(ai.tipo_sugerido); tipo = TIPOS.includes(s) ? s : 'outro'; }\n\nconst marcarVisto = () => { sd.vistos.push(j.emailId); if (sd.vistos.length > MAX_VISTOS) sd.vistos = sd.vistos.slice(-MAX_VISTOS); };\n\nif (tipo === 'outro') {\n  run.ignorados = (run.ignorados || 0) + 1;\n  marcarVisto();\n  return { json: { notificar: false, tipo, empresa, vaga, emailId: j.emailId, marcarLido: false } };\n}\n\n// 4. Acha (ou cria) a candidatura correspondente\nconst ek = norm(empresa).replace(/[^a-z0-9]/g, '');\nconst vk = norm(vaga).replace(/[^a-z0-9 ]/g, ' ').replace(/\\s+/g, ' ').trim();\nlet app = null, melhor = -1;\nfor (const a of Object.values(sd.apps)) {\n  if (a.ek !== ek) continue;\n  let pontos = 0;\n  if (a.vk === vk) pontos = 3;\n  else if (vk && a.vk && (a.vk.includes(vk) || vk.includes(a.vk))) pontos = 2;\n  else if (!vk || !a.vk) pontos = 1;\n  if (pontos > melhor) { melhor = pontos; app = a; }\n}\nconst nova = !app;\nif (nova) {\n  app = { id: ek + '|' + vk, ek, vk, empresa, vaga, status: 'enviada', plataforma: j.plataforma, primeira: j.data, hist: [] };\n  sd.apps[app.id] = app;\n  run.novasApps = (run.novasApps || 0) + 1;\n}\nif (vaga.length > (app.vaga || '').length && !nova) { app.vaga = vaga; }   // guarda o nome mais completo\nif (empresa !== 'Empresa não identificada' && app.empresa === 'Empresa não identificada') app.empresa = empresa;\n\n// 5. Atualiza o status (nunca volta atrás; recusa/cancelamento encerram)\nconst novoStatus = STATUS_DO_TIPO[tipo];\nconst statusAntes = app.status;\nlet mudou = false;\nif (TERMINAL.has(app.status) && !TERMINAL.has(novoStatus)) {\n  // candidatura já encerrada: ignora emails posteriores que não sejam de encerramento\n} else if (TERMINAL.has(novoStatus) || RANK[novoStatus] >= RANK[app.status]) {\n  mudou = novoStatus !== app.status || tipo === 'etapa' || tipo === 'entrevista';\n  app.status = novoStatus;\n}\napp.ultima = j.data; app.link = j.link; app.plataforma = j.plataforma;\nif (prazo && (tipo === 'etapa' || tipo === 'entrevista')) app.prazo = prazo;\nif (motivo && (tipo === 'recusa' || tipo === 'cancelamento' || tipo === 'etapa' || tipo === 'oferta')) app.motivo = motivo;\napp.hist.push({ data: j.data, tipo, assunto: (j.assunto || '').slice(0, 90) });\nif (app.hist.length > 12) app.hist = app.hist.slice(-12);\nmarcarVisto();\n\n// 6. Contagem para o resumo\nrun.porTipo[tipo] = (run.porTipo[tipo] || 0) + 1;\nif (tipo === 'confirmacao' && nova) { run.confirmacoes = run.confirmacoes || []; if (run.confirmacoes.length < 40) run.confirmacoes.push(`${app.empresa} — ${nomeVaga(app)}`.slice(0, 90)); }\n\n// 7. Decide se avisa agora\nconst idadeDias = (Date.now() - new Date(j.data).getTime()) / 86400000;\nconst alertavel = !!ALERTAS[tipo];\nconst aviso = alertavel && mudou && idadeDias <= DIAS_ALERTA_RECENTE;\nif (alertavel && mudou && !aviso) run.suprimidos = (run.suprimidos || 0) + 1;\n// marcar como lido só o que não pede ação (confirmação / visualizada); o resto fica em negrito para você abrir\nconst marcarLido = ['confirmacao', 'visualizada'].includes(tipo);\nif (!aviso) return { json: { notificar: false, tipo, empresa: app.empresa, vaga: nomeVaga(app), emailId: j.emailId, marcarLido } };\n\nrun.alertas = (run.alertas || 0) + 1;\nlet texto = `${ALERTAS[tipo]}\\n🏢 *Empresa:* ${app.empresa}\\n📌 *Vaga:* ${nomeVaga(app)}\\n📨 *Via:* ${j.plataforma}`;\nif (prazo && (tipo === 'etapa' || tipo === 'entrevista')) texto += `\\n⏰ *Prazo/Data:* ${prazo}`;\nif (motivo) texto += `\\n💬 ${motivo}`;\nif (erroIA) texto += `\\n\\nℹ️ A IA não conseguiu ler o email; empresa e vaga podem estar incompletas.`;\ntexto += `\\n\\n📧 [Abrir o email](${j.link})\\n🗂 [Painel de candidaturas](${PAINEL_URL})`;\nreturn { json: { notificar: true, texto, tipo, empresa: app.empresa, vaga: nomeVaga(app), emailId: j.emailId, marcarLido } };\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7632,
+        2704
+      ],
+      "id": "1e3b5e9d-3d01-4faf-9ecb-209ebd20ce34",
+      "name": "Atualizar painel"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "3039b67e-ddf9-4722-afc4-75fbb44c347f",
+              "leftValue": "={{ $json.notificar }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        7888,
+        2704
+      ],
+      "id": "243e4cc2-9553-40a8-84a3-8db970dc558b",
+      "name": "Avisar?"
+    },
+    {
+      "parameters": {
+        "chatId": "SEU_CHAT_ID_DO_TELEGRAM",
+        "text": "={{ $json.texto }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        8144,
+        2592
+      ],
+      "id": "65e9f4f7-e34e-4f79-a1a5-aa9bc46a4fd2",
+      "name": "Alerta Telegram",
+      "webhookId": "27cac9c5-5f41-448b-afa4-cc3f96ce44a3",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "414682f7-0232-4a0b-b6b3-faf6361b3043",
+              "leftValue": "={{ $('Atualizar painel').item.json.tipo === 'outro' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        8400,
+        2592
+      ],
+      "id": "af8e1251-7efa-4363-a1dc-c016d5f6eda2",
+      "name": "É outro?"
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $('Loop Over Items').item.json.emailId }}",
+        "labelIds": [
+          "ID_DA_ETIQUETA_TRABALHO"
+        ]
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        8672,
+        2384
+      ],
+      "id": "50628f49-85c0-4080-befa-2db98d7976cd",
+      "name": "Etiquetar so Trabalho",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "webhookId": "b2647b83-a57a-4c78-88bd-a3b7ff88d2e7",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $('Loop Over Items').item.json.emailId }}",
+        "labelIds": [
+          "ID_DA_ETIQUETA_TRABALHO",
+          "ID_DA_ETIQUETA_CANDIDATURAS"
+        ]
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        8672,
+        2592
+      ],
+      "id": "15a72506-b5ee-4f59-98fb-372d00fcfef9",
+      "name": "Etiquetar email",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "webhookId": "e5791e89-d53b-4414-8cf8-9c0de9646069",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "5eb9cabb-9664-4d30-9eee-3e3a74fd8441",
+              "leftValue": "={{ $('Atualizar painel').item.json.marcarLido }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        8928,
+        2592
+      ],
+      "id": "54e39698-1ac4-44b9-9fd9-9035ce2667c9",
+      "name": "Marcar como lido?"
+    },
+    {
+      "parameters": {
+        "operation": "markAsRead",
+        "messageId": "={{ $('Loop Over Items').item.json.emailId }}"
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        9184,
+        2480
+      ],
+      "id": "7b557872-cdf1-4cfe-87fa-4f76d1b08586",
+      "name": "Marcar como lido",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "webhookId": "a83177be-66a7-44f6-8e96-aba5f02b7453",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "amount": 8
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        9440,
+        2720
+      ],
+      "id": "63a60a93-490b-4f66-8d17-9d0a8b1540de",
+      "name": "Wait",
+      "webhookId": "75b2342c-6b2c-465d-8e6b-bfcae293c279"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== RESUMO DA RODADA =====\n// Mensagem única no fim: confirmações novas, alertas e o total do painel.\n// Em execução diária sem novidade não manda nada (retorna lista vazia).\nconst sd = $getWorkflowStaticData('global');\nconst run = sd.run || {};\nconst apps = Object.values(sd.apps || {});\nconst t = run.porTipo || {};\nconst backfill = run.modo === 'backfill';\nconst teveNovidade = (run.novasApps || 0) > 0 || (run.alertas || 0) > 0 || (run.suprimidos || 0) > 0 || Object.keys(t).length > 0;\nif (!backfill && !teveNovidade) return [];\n\nconst PAINEL_URL = 'http://localhost:5678/webhook/candidaturas';\nconst cont = (s) => apps.filter(a => a.status === s).length;\nlet m = backfill ? '📦 *Candidaturas — carga inicial*\\n' : '📋 *Candidaturas — resumo*\\n';\nm += `📧 Emails lidos: ${run.lidos || 0} · analisados: ${run.novos || 0}`;\nif (run.adiados) m += ` · adiados: ${run.adiados}`;\nm += '\\n';\nif (run.novasApps) m += `🆕 Candidaturas novas no painel: ${run.novasApps}\\n`;\nconst linhas = [];\nif (t.entrevista) linhas.push(`🗓️ entrevistas: ${t.entrevista}`);\nif (t.etapa) linhas.push(`📝 etapas/testes: ${t.etapa}`);\nif (t.oferta) linhas.push(`🎉 propostas: ${t.oferta}`);\nif (t.recusa) linhas.push(`❌ recusas: ${t.recusa}`);\nif (t.cancelamento) linhas.push(`🚫 cancelamentos: ${t.cancelamento}`);\nif (linhas.length) m += linhas.join(' · ') + '\\n';\nif (run.suprimidos) m += `(${run.suprimidos} resposta(s) antiga(s) entraram no painel sem alerta individual)\\n`;\nconst conf = (run.confirmacoes || []).slice(0, 8);\nif (conf.length) {\n  m += `\\n✅ *Confirmadas:*\\n` + conf.map(c => `• ${c.replace(/[*_`\\[\\]]/g, '')}`).join('\\n');\n  if ((run.confirmacoes || []).length > conf.length) m += `\\n• … e mais ${(run.confirmacoes || []).length - conf.length}`;\n  m += '\\n';\n}\nm += `\\n🗂 *Painel:* ${apps.length} candidaturas · ${cont('enviada') + cont('em_analise')} aguardando · ${cont('etapa') + cont('entrevista')} em andamento · ${cont('recusada') + cont('cancelada')} encerradas\\n${PAINEL_URL}`;\nreturn [{ json: { texto: m } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7104,
+        2400
+      ],
+      "id": "943dcc21-39d7-4f66-a80d-be88f6552b64",
+      "name": "Montar resumo"
+    },
+    {
+      "parameters": {
+        "chatId": "SEU_CHAT_ID_DO_TELEGRAM",
+        "text": "={{ $json.texto }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        7360,
+        2400
+      ],
+      "id": "8bbb233b-973b-4690-b4f4-99b7857532e0",
+      "name": "Resumo Telegram",
+      "webhookId": "92cc7878-f01b-42d4-b433-b88f55c5c086",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "path": "candidaturas-etiquetar-historico",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        5552,
+        3520
+      ],
+      "id": "ee225e3c-e4a3-44f6-82a8-ec308f4717dd",
+      "name": "Webhook Etiquetar historico",
+      "webhookId": "31d5b9d5-5239-40ec-88f4-9f4b81ce79e4"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== UTILITÁRIO (uso único): lista os emails que o robô já processou =====\n// Só existe memória em execução de verdade (link /webhook/, sem \"-test\").\nconst sd = $getWorkflowStaticData('global');\nconst ids = [...new Set(sd.vistos || [])];\nif (!ids.length) return [{ json: { messageId: '', vazio: true } }];\nreturn ids.map(id => ({ json: { messageId: id } }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5808,
+        3520
+      ],
+      "id": "4aceea17-117b-42c1-bdff-ef93c6daae6d",
+      "name": "Listar IDs vistos"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "17c0765b-0370-4ecb-b499-4b3e8c161c75",
+              "leftValue": "={{ !!$json.messageId }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        6064,
+        3520
+      ],
+      "id": "a7cd9216-676d-40c3-b979-e87cffa7e10e",
+      "name": "Tem ID?"
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $json.messageId }}",
+        "labelIds": [
+          "ID_DA_ETIQUETA_TRABALHO",
+          "ID_DA_ETIQUETA_CANDIDATURAS"
+        ]
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        6320,
+        3520
+      ],
+      "id": "74307f3c-f436-4001-8495-e70d814e3c8d",
+      "name": "Etiquetar historico",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "webhookId": "bfa4005e-6f03-419c-b734-9021ab14e3fd",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const itens = $input.all().filter(i => i.json && !i.json.error);\nconst total = $('Listar IDs vistos').all().filter(i => i.json.messageId).length;\nconst erros = $input.all().length - itens.length;\nreturn [{ json: { texto: `🏷 *Etiquetas aplicadas no histórico*\\nEmails já processados: ${total}\\nComo etiqueta: Trabalho + Candidaturas${erros ? `\\n⚠️ Falhas: ${erros}` : ''}` } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6592,
+        3520
+      ],
+      "id": "59411b51-5fdc-4653-84ef-d93e0a05affc",
+      "name": "Resumo etiquetas"
+    },
+    {
+      "parameters": {
+        "chatId": "SEU_CHAT_ID_DO_TELEGRAM",
+        "text": "={{ $json.texto }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        6848,
+        3520
+      ],
+      "id": "b3ff2c98-0d0e-42a1-84c0-995e4b75e76e",
+      "name": "Telegram etiquetas",
+      "webhookId": "32eb43c1-7778-4c28-b4ce-a6d7c2d2e7aa",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "path": "candidaturas",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        5552,
+        3184
+      ],
+      "id": "5499f97e-3094-4279-a0ed-e0da536f0e27",
+      "name": "Webhook Painel",
+      "webhookId": "fab87a6e-53b7-44f8-a83a-3037e20ba9f5"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== PAINEL DE CANDIDATURAS (página HTML) =====\n// Abre em http://localhost:5678/webhook/candidaturas\nconst sd = $getWorkflowStaticData('global');\nconst apps = Object.values(sd.apps || {});\nconst esc = (s) => (s == null ? '' : String(s)).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\nconst ROTULO = { enviada: 'Enviada', em_analise: 'Em análise', etapa: 'Etapa / teste', entrevista: 'Entrevista', oferta: 'Proposta', recusada: 'Recusada', cancelada: 'Cancelada' };\nconst ORDEM = { entrevista: 0, oferta: 1, etapa: 2, em_analise: 3, enviada: 4, recusada: 5, cancelada: 6 };\nconst fmt = (iso) => { try { return new Date(iso).toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' }); } catch (e) { return ''; } };\n\napps.sort((a, b) => (ORDEM[a.status] - ORDEM[b.status]) || String(b.ultima).localeCompare(String(a.ultima)));\nconst total = apps.length;\nconst n = (s) => apps.filter(a => a.status === s).length;\nconst chips = Object.keys(ROTULO).map(s => `<span class=\"chip ${s}\">${ROTULO[s]} <b>${n(s)}</b></span>`).join('');\nconst linhas = apps.map(a => `<tr>\n<td><b>${esc(a.empresa)}</b></td><td>${esc(a.vaga || 'Vaga não informada')}</td>\n<td><span class=\"chip ${esc(a.status)}\">${ROTULO[a.status] || esc(a.status)}</span>${a.prazo ? `<div class=\"sub\">⏰ ${esc(a.prazo)}</div>` : ''}${a.motivo ? `<div class=\"sub\">${esc(a.motivo)}</div>` : ''}</td>\n<td>${esc(a.plataforma)}</td><td>${fmt(a.primeira)}</td><td>${fmt(a.ultima)}</td>\n<td>${a.link ? `<a href=\"${esc(a.link)}\" target=\"_blank\" rel=\"noopener\">email</a>` : ''}</td></tr>`).join('');\n\nconst html = `<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Painel de candidaturas</title>\n<style>\n:root{--bg:#fff;--fg:#1c1b1a;--mut:#6b6762;--line:#e4e1dc;--card:#faf9f7}\n@media(prefers-color-scheme:dark){:root{--bg:#161514;--fg:#ecebe8;--mut:#9a958d;--line:#2d2b28;--card:#1e1d1b}}\nbody{margin:0;padding:24px 16px;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}\nmain{max-width:1100px;margin:0 auto}h1{font-size:22px;margin:0 0 4px}.mut{color:var(--mut);margin:0 0 16px}\n.chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:18px}\n.chip{display:inline-block;padding:2px 10px;border-radius:999px;font-size:13px;border:1px solid var(--line);background:var(--card);white-space:nowrap}\n.chip.entrevista,.chip.oferta{background:#1f7a4d;color:#fff;border-color:#1f7a4d}.chip.etapa{background:#b8860b;color:#fff;border-color:#b8860b}\n.chip.recusada,.chip.cancelada{color:var(--mut);text-decoration:line-through}\n.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px}table{border-collapse:collapse;width:100%;min-width:760px}\nth,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);background:var(--card)}\ntr:last-child td{border-bottom:0}.sub{font-size:12px;color:var(--mut);margin-top:3px;max-width:260px}a{color:inherit}\n</style></head><body><main>\n<h1>Painel de candidaturas</h1><p class=\"mut\">${total} candidatura${total === 1 ? '' : 's'} · atualizado pelo workflow a cada execução</p>\n<div class=\"chips\">${chips}</div>\n<div class=\"wrap\"><table><thead><tr><th>Empresa</th><th>Vaga</th><th>Status</th><th>Via</th><th>Início</th><th>Última</th><th></th></tr></thead>\n<tbody>${linhas || '<tr><td colspan=\"7\">Nenhuma candidatura registrada ainda. Rode o backfill: /webhook/candidaturas-backfill?dias=90</td></tr>'}</tbody></table></div>\n</main></body></html>`;\nreturn [{ json: { html } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5808,
+        3184
+      ],
+      "id": "f8d69a36-2016-4700-bde6-f4cf125ab952",
+      "name": "Montar painel"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        6064,
+        3184
+      ],
+      "id": "425d3c35-44e3-4f92-86d9-f292db143daa",
+      "name": "Responder painel"
+    },
+    {
+      "parameters": {
+        "content": "**Candidaturas v1** — roda 3 vezes por dia (9h30, 14h30, 20h30), lê os emails de resposta das plataformas (Solides, Gupy, Inhire, Mindsight, Indeed, LinkedIn, empresas), reconhece o tipo por regras e avisa no Telegram de entrevista, teste, recusa, cancelamento e proposta. Confirmações vão num resumo.\n\n**Credenciais:** depois de importar, abra os nós de Telegram e escolha a credencial do 3º bot (Candidaturas). Gmail e Groq já vêm ligados.\n\n**Ativar:** botão Publish. A lista de candidaturas e os emails já vistos só ficam salvos em execução real; o teste manual processa só 5 emails.\n\n**Carga inicial (uma vez):** com o workflow ativo, abra http://localhost:5678/webhook/candidaturas-backfill?dias=90\n**Painel:** http://localhost:5678/webhook/candidaturas\n\n**Uso único (etiquetar histórico):** http://localhost:5678/webhook/candidaturas-etiquetar-historico\n\n**Ajustes:** remetentes e janela de dias em 'Montar busca'; regras de tipo em 'Classificar emails'; quando avisar em 'Atualizar painel'.",
+        "height": 300,
+        "width": 780
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        5520,
+        2000
+      ],
+      "id": "6a632308-15cf-40ae-bbd0-946457f3609d",
+      "name": "Nota"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Montar busca",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Backfill": {
+      "main": [
+        [
+          {
+            "node": "Montar busca",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar busca": {
+      "main": [
+        [
+          {
+            "node": "Buscar emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar emails": {
+      "main": [
+        [
+          {
+            "node": "Classificar emails",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Aviso erro Gmail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classificar emails": {
+      "main": [
+        [
+          {
+            "node": "Tem email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tem email?": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Montar resumo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Montar resumo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "IA respondeu?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IA respondeu?": {
+      "main": [
+        [
+          {
+            "node": "Atualizar painel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Basic LLM Chain reserva",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model reserva": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain reserva",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain reserva": {
+      "main": [
+        [
+          {
+            "node": "Atualizar painel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Atualizar painel": {
+      "main": [
+        [
+          {
+            "node": "Avisar?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Avisar?": {
+      "main": [
+        [
+          {
+            "node": "Alerta Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "É outro?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alerta Telegram": {
+      "main": [
+        [
+          {
+            "node": "É outro?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É outro?": {
+      "main": [
+        [
+          {
+            "node": "Etiquetar so Trabalho",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Etiquetar email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Etiquetar so Trabalho": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Etiquetar email": {
+      "main": [
+        [
+          {
+            "node": "Marcar como lido?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Marcar como lido?": {
+      "main": [
+        [
+          {
+            "node": "Marcar como lido",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Marcar como lido": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar resumo": {
+      "main": [
+        [
+          {
+            "node": "Resumo Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Etiquetar historico": {
+      "main": [
+        [
+          {
+            "node": "Listar IDs vistos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Listar IDs vistos": {
+      "main": [
+        [
+          {
+            "node": "Tem ID?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tem ID?": {
+      "main": [
+        [
+          {
+            "node": "Etiquetar historico",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Etiquetar historico": {
+      "main": [
+        [
+          {
+            "node": "Resumo etiquetas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resumo etiquetas": {
+      "main": [
+        [
+          {
+            "node": "Telegram etiquetas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Painel": {
+      "main": [
+        [
+          {
+            "node": "Montar painel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar painel": {
+      "main": [
+        [
+          {
+            "node": "Responder painel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "timezone": "America/Sao_Paulo",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "meta": {},
+  "nodeGroups": [],
+  "tags": []
+}

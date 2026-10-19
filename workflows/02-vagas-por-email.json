@@ -1,0 +1,928 @@
+{
+  "name": "Vagas por Email",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 17
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        11008,
+        3552
+      ],
+      "id": "2804e09d-0fad-478f-ac8c-6d12571328be",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "path": "vagas-email-backfill",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        11008,
+        3776
+      ],
+      "id": "d05dbd60-da1e-432d-ad8c-a20324febbb0",
+      "name": "Webhook Backfill",
+      "webhookId": "4e431202-2e1f-4f37-8c87-1428f7de3e0f"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== MONTAR BUSCA =====\n// Define o que será buscado no Gmail. Dois caminhos chegam aqui:\n//  - Schedule Trigger (diário): últimos 3 dias, só emails ainda sem o rótulo \"Vagas-processado\"\n//  - Webhook (backfill manual): usa ?dias=60  ou  ?inicio=2026/08/01&fim=2026/10/16\n\n// ====== CONFIGURAÇÃO ======\nconst DIAS_DIARIO = 3;\nconst DIAS_BACKFILL_PADRAO = 60;\nconst ROTULO_PROCESSADO = 'Vagas-processado';\nconst REMETENTES = [\n  'jobalerts-noreply@linkedin.com',\n  'noreply@glassdoor.com',\n  'donotreply@jobalert.indeed.com',\n  'donotreply@match.indeed.com'\n];\n// ==========================\n\nconst entrada = $input.first().json || {};\nconst query = entrada.query || {};            // vem do Webhook (?dias=..&inicio=..&fim=..)\nconst veioDoWebhook = !!(entrada.query || entrada.headers);\n\nlet periodo = `newer_than:${DIAS_DIARIO}d`;\nlet modo = 'diario';\nif (veioDoWebhook) {\n  modo = 'backfill';\n  const ok = (d) => /^\\d{4}\\/\\d{2}\\/\\d{2}$/.test(d || '');\n  if (ok(query.inicio) || ok(query.fim)) {\n    periodo = [ok(query.inicio) ? `after:${query.inicio}` : '', ok(query.fim) ? `before:${query.fim}` : ''].filter(Boolean).join(' ');\n  } else {\n    const dias = Math.min(Math.max(parseInt(query.dias, 10) || DIAS_BACKFILL_PADRAO, 1), 400);\n    periodo = `newer_than:${dias}d`;\n  }\n}\n\nconst q = `from:(${REMETENTES.join(' OR ')}) ${periodo} -label:${ROTULO_PROCESSADO}`;\nreturn [{ json: { q, modo, periodo } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        11264,
+        3632
+      ],
+      "id": "5f4dd3ae-5d01-4bf9-a6d9-5c36e0b24075",
+      "name": "Montar busca"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "simple": false,
+        "filters": {
+          "includeSpamTrash": true,
+          "q": "={{ $json.q }}"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        11520,
+        3632
+      ],
+      "id": "967fcc3b-53e7-4773-a210-92d3c672ff1b",
+      "name": "Buscar emails",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "webhookId": "905d85c6-408b-40a3-b6e9-2ab4c6f28a52",
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== EXTRAIR E ENFILEIRAR =====\n// Lê os emails de alerta, extrai as vagas, tira repetidas, faz a triagem barata por título,\n// guarda o excedente numa fila (memória do workflow) e entrega só as vagas do dia para a IA.\n\n// ====== CONFIGURAÇÃO ======\nconst LIMITE_IA_POR_RODADA = 50;  // vagas que vão para a IA por execução (Groq grátis)\nconst LIMITE_TESTE = 5;           // em execução manual (teste) só processa esta quantidade\nconst MAX_VISTOS = 6000;          // quantos IDs de vagas já vistas ficam guardados\nconst MAX_FILA = 800;             // tamanho máximo da fila de espera\nconst DIAS_VALIDADE = 45;         // vaga na fila há mais tempo que isso é descartada\nconst SNIPPET_MAX = 400;          // caracteres do trecho de descrição vindo do email\n\n// ====== UTILIDADES ======\nconst norm = (s) => (s || '').toString().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');\nconst hash = (s) => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); };\nconst decode = (s) => (s || '').replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ').replace(/&quot;/g, '\"').replace(/&#39;/g, \"'\").replace(/&lt;/g, '<').replace(/&gt;/g, '>');\nconst linhas = (t) => (t || '').split(/\\r?\\n/).map(s => s.replace(/[​-‏⁠﻿͏]/g, '').trim());\n\nfunction htmlParaMd(html) {\n  return decode((html || '')\n    .replace(/<(script|style)[\\s\\S]*?<\\/\\1>/gi, '')\n    .replace(/<a\\b[^>]*?href=[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)<\\/a>/gi, (m, h, t) => '[' + t.replace(/<[^>]+>/g, '|') + '](' + h + ')')\n    .replace(/<br\\s*\\/?>|<\\/(p|div|tr|li|h\\d|table)>/gi, '\\n')\n    .replace(/<[^>]+>/g, ' '));\n}\nfunction htmlParaTexto(html) {\n  return decode((html || '')\n    .replace(/<(script|style)[\\s\\S]*?<\\/\\1>/gi, '')\n    .replace(/<a\\b[^>]*?href=[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)<\\/a>/gi, (m, h, t) => '\\n' + t.replace(/<[^>]+>/g, ' ') + '\\nURL: ' + h + '\\n')\n    .replace(/<br\\s*\\/?>|<\\/(p|div|tr|li|h\\d|table|td)>/gi, '\\n')\n    .replace(/<[^>]+>/g, ' '))\n    .replace(/[ \\t]+/g, ' ').replace(/\\n\\s*\\n+/g, '\\n\\n');\n}\n\n// \"R$ 3.745 por mês\" -> {min,max,texto} em R$/mês\nfunction lerSalario(txt) {\n  if (!txt) return null;\n  const t = txt.replace(/ /g, ' ');\n  const nums = [...t.matchAll(/R\\$\\s*([\\d]{1,3}(?:\\.\\d{3})*(?:,\\d{1,2})?|\\d+(?:,\\d{1,2})?)/g)]\n    .map(m => parseFloat(m[1].replace(/\\./g, '').replace(',', '.'))).filter(n => !isNaN(n));\n  if (!nums.length) return null;\n  let mult = 1;\n  const n = norm(t);\n  if (/por hora|\\/ ?hora/.test(n)) mult = 176;\n  else if (/por semana|\\/ ?semana/.test(n)) mult = 4.33;\n  else if (/por dia|\\/ ?dia/.test(n)) mult = 22;\n  else if (/por ano|\\/ ?ano|anual/.test(n)) mult = 1 / 12;\n  const v = nums.map(x => Math.round(x * mult));\n  const min = Math.min(...v), max = Math.max(...v);\n  if (min < 300) return null; // lixo\n  return { min, max, texto: t.trim().slice(0, 80) };\n}\nconst lerModalidade = (s) => {\n  const n = norm(s);\n  if (/remot|home office|trabalho a distancia/.test(n)) return 'remoto';\n  if (/hibrid/.test(n)) return 'hibrido';\n  if (/presencial/.test(n)) return 'presencial';\n  return null;\n};\nconst idadeDias = (s) => {\n  const n = norm(s);\n  if (/\\b(hoje|agora|just posted|today)\\b/.test(n)) return 0;\n  if (/\\bontem\\b/.test(n)) return 1;\n  const m = n.match(/(\\d+)\\s*(\\+)?\\s*(dia|d\\b|hora|h\\b|semana|mes)/);\n  if (!m) return null;\n  const v = parseInt(m[1], 10);\n  if (/hora|^h/.test(m[3])) return 0;\n  if (/semana/.test(m[3])) return v * 7;\n  if (/mes/.test(m[3])) return v * 30;\n  return v;\n};\n\n// ====== PARSERS ======\nfunction parseLinkedIn(txt, ctx) {\n  const out = [];\n  for (const b of txt.split(/\\n-{20,}\\n/)) {\n    if (!/jobs\\/view\\/\\d+/.test(b)) continue;\n    let ls = linhas(b).filter(Boolean);\n    const iv = ls.findIndex(l => /jobs\\/view\\/\\d+/.test(l));\n    const id = (ls[iv].match(/jobs\\/view\\/(\\d+)/) || [])[1];\n    ls = ls.slice(0, iv);\n    const ih = ls.map((l, i) => /alerta de vaga|novas vagas correspondem|foi criado|suas preferencias/.test(norm(l)) ? i : -1).filter(i => i >= 0).pop();\n    if (ih !== undefined) ls = ls.slice(ih + 1);\n    if (!id || ls.length < 3) continue;\n    out.push({\n      source: 'linkedin', rawId: id, key: 'li:' + id,\n      title: ls[0], companyName: ls[1], location: ls[2],\n      link: `https://www.linkedin.com/jobs/view/${id}/`,\n      fetchUrl: `https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/${id}`,  // endpoint público que devolve a descrição sem login\n      description: '', ageDays: null, rating: null,\n      modalidade: lerModalidade(ls[2])\n    });\n  }\n  return out;\n}\n\nfunction parseGlassdoor(md, ctx) {\n  const out = [];\n  const re = /\\[([^\\]]*?)\\]\\((https?:\\/\\/[^)\\s]*jobListingId=(\\d+)[^)\\s]*)\\)/g;\n  let m;\n  while ((m = re.exec(md)) !== null) {\n    let tk = m[1].split(/\\||\\n/).map(s => s.trim()).filter(s => s && s !== '★');\n    if (tk.length < 3) continue;\n    let company = tk[0], rating = null, i = 1;\n    const mr = company.match(/^(.*?)\\s+(\\d[.,]\\d)\\s*★?$/);\n    if (mr) { company = mr[1]; rating = parseFloat(mr[2].replace(',', '.')); }\n    else if (/^\\d[.,]\\d$/.test(tk[1])) { rating = parseFloat(tk[1].replace(',', '.')); i = 2; }\n    const title = tk[i], location = tk[i + 1] || '';\n    const resto = tk.slice(i + 2).join(' ');\n    out.push({\n      source: 'glassdoor', rawId: m[3], key: 'gd:' + m[3],\n      title, companyName: company, location,\n      link: decode(m[2]),\n      description: '', ageDays: idadeDias(resto), rating,\n      modalidade: lerModalidade(location)\n    });\n  }\n  return out;\n}\n\nfunction parseIndeedAlerta(txt, ctx) {\n  const out = [];\n  const ls = linhas(txt);\n  let bloco = [];\n  const fecha = () => {\n    const iu = bloco.findIndex(l => /indeed\\.com\\/.*[?&]jk=[0-9a-f]+/i.test(l));\n    if (iu > 0) {\n      const jk = bloco[iu].match(/[?&]jk=([0-9a-f]+)/i)[1];\n      let corpo = bloco.slice(0, iu);\n      let idade = null;\n      if (corpo.length && /^(h[aá]\\s+\\d|h[aá]\\s+mais|hoje|ontem|publicad|\\d+\\s*(dia|hora)s?)/i.test(corpo[corpo.length - 1])) {\n        idade = idadeDias(corpo[corpo.length - 1]); corpo = corpo.slice(0, -1);\n      }\n      if (corpo.length >= 2) {\n        const title = corpo[0];\n        const cl = corpo[1];\n        const k = cl.lastIndexOf(' - ');\n        const companyName = k > 0 ? cl.slice(0, k).trim() : cl;\n        const location = k > 0 ? cl.slice(k + 3).trim() : '';\n        const extras = corpo.slice(2).filter(l => !/^candidate-se facilmente$|^easily apply$/i.test(l));\n        const sal = lerSalario(extras.join(' '));\n        const snippet = extras.filter(l => !/R\\$/.test(l)).join(' ');\n        out.push({\n          source: 'indeed', rawId: jk, key: 'in:' + jk,\n          title, companyName, location,\n          link: `https://br.indeed.com/viewjob?jk=${jk}`,\n          description: snippet, ageDays: idade, rating: null,\n          salaryMin: sal ? sal.min : null, salaryMax: sal ? sal.max : null, salaryText: sal ? sal.texto : '',\n          modalidade: lerModalidade(location)\n        });\n      }\n    }\n    bloco = [];\n  };\n  for (const l of ls) { if (!l) fecha(); else bloco.push(l); }\n  fecha();\n  return out;\n}\n\nfunction parseIndeedMatch(txt, ctx) {\n  const ls = linhas(txt);\n  const vm = txt.match(/(?:Ver vaga|Candidatar-se agora):\\s*(https?:\\/\\/\\S+)/);\n  const link = vm ? vm[1] : '';\n  let title = '', company = '', location = '';\n  const ms = (ctx.subject || '').match(/^(.*?)\\s+na empresa\\s+(.*)$/);\n  if (ms) { title = ms[1].trim(); company = ms[2].trim(); }\n  let i = title ? ls.findIndex(l => l === title) : -1;\n  if (i < 0) {\n    const f = ls.findIndex(l => /^(Salário|Tipo de vaga|Horário de trabalho|Ambiente de trabalho|Benefícios)\\s*:?/i.test(l));\n    if (f >= 3) { title = ls[f - 3]; company = ls[f - 2]; location = ls[f - 1]; }\n  } else {\n    if (!company) company = ls[i + 1] || '';\n    location = ls[i + 2] || '';\n  }\n  if (!title || !link) return [];\n  const campo = (rot) => { const l = ls.find(x => new RegExp('^' + rot + '\\\\s*:', 'i').test(x)); return l ? l.replace(/^[^:]+:\\s*/, '') : ''; };\n  const sal = lerSalario(campo('Sal[aá]rio'));\n  const ib = ls.findIndex(l => /^Benef[ií]cios\\s*:/i.test(l));\n  const beneficios = [];\n  if (ib >= 0) for (let j = ib + 1; j < ls.length && /^[-•*]/.test(ls[j]); j++) beneficios.push(ls[j].replace(/^[-•*]\\s*/, ''));\n  const amb = campo('Ambiente de trabalho');\n  const tipo = campo('Tipo de vaga');\n  return [{\n    source: 'indeed_match', rawId: hash(norm(title + company + location)),\n    key: 'im:' + hash(norm(title + company + location)),\n    title, companyName: company, location, link,\n    description: [tipo && ('Tipo: ' + tipo), campo('Hor[aá]rio de trabalho') && ('Horário: ' + campo('Hor[aá]rio de trabalho')), amb && ('Ambiente: ' + amb)].filter(Boolean).join('. '),\n    ageDays: 0, rating: null,\n    salaryMin: sal ? sal.min : null, salaryMax: sal ? sal.max : null, salaryText: sal ? sal.texto : '',\n    beneficios, modalidade: lerModalidade(amb) || lerModalidade(location)\n  }];\n}\n\n// ====== TRIAGEM BARATA POR TÍTULO ======\nconst SENIORIDADE = ['senior', 'sr', 'pleno', 'pl', 'especialista', 'ii', 'iii', 'iv', 'v', 'lead', 'lider', 'head', 'staff', 'principal', 'arquiteto', 'arquiteta', 'coordenador', 'coordenadora', 'gerente', 'manager', 'director', 'diretor', 'diretora', 'supervisor', 'supervisora', 'executivo', 'executiva'];\nconst ENG_NAO_TI = ['civil', 'mecanica', 'mecanico', 'eletrica', 'eletrico', 'quimica', 'producao', 'manutencao', 'minas', 'metalurgica', 'ambiental', 'agronomia', 'naval', 'petroleo'];\nconst FORA_AREA = ['direito', 'juridico', 'medicina', 'enfermagem', 'farmacia', 'odontologia', 'psicologia', 'nutricao', 'veterinaria', 'pedagogia', 'arquitetura', 'fisioterapia', 'biomedicina', 'agronomia', 'laboratorio', 'hse', 'seguranca do trabalho', 'motorista', 'cozinh', 'barbeiro', 'costura'];\nconst T1 = ['dados', 'data', 'analytics', 'bi', 'power bi', 'python', 'sql', 'ia', 'inteligencia artificial', 'machine learning', 'automacao', 'rpa', 'excel', 'planilha', 'indicadores', 'bi'];\nconst T2 = ['suporte', 'service desk', 'help desk', 'helpdesk', 'ti', 'tecnologia da informacao', 'infraestrutura', 'sistemas', 'software', 'desenvolvedor', 'desenvolvedora', 'developer', 'programador', 'qa', 'teste', 'testes', 'tester', 'qualidade de software', 'web', 'front end', 'frontend', 'back end', 'backend', 'full stack', 'fullstack', 'informatica', 'redes', 'tecnologia', 'it', 'devops', 'dev'];\nconst T3 = ['analista', 'atendimento', 'administrativo', 'assistente', 'auxiliar', 'dp', 'departamento pessoal', 'contabil', 'financeiro', 'fiscal', 'logistica', 'estoque', 'comercial', 'pre vendas', 'pre-vendas', 'sdr', 'e-commerce', 'ecommerce', 'operacoes', 'backoffice', 'back office', 'cadastro', 'documentacao', 'arquivista', 'secretaria', 'processos', 'qualidade', 'rh', 'recursos humanos', 'recrutamento', 'marketing', 'vendas', 'atendente', 'recepcionista', 'faturamento', 'cobranca', 'compras', 'suprimentos'];\nconst ENTRADA = ['estagio', 'estagiario', 'estagiaria', 'trainee', 'junior', 'jr', 'aprendiz', 'assistente', 'auxiliar', 'entrada', 'intern', 'internship', 'jovem talento', 'young talent'];\n\nconst temTermo = (t, lista) => lista.some(x => {\n  if (x.length <= 4 || x.indexOf(' ') > 0 || x.indexOf('-') > 0) return new RegExp('(^|[^a-z0-9])' + x.replace(/[-\\s]/g, '[-\\\\s]?') + '([^a-z0-9]|$)').test(t);\n  return t.includes(x);\n});\n\nfunction triagem(v) {\n  const t = norm(v.title).replace(/[()\\[\\]\\/|,–—:]/g, ' ');\n  if (temTermo(t, SENIORIDADE)) return { ok: false, motivo: 'senioridade' };\n  if (/engenhari|engenheir/.test(t) && !/software|computac|dados|sistemas|\\bti\\b|automacao de|dev/.test(t)) return { ok: false, motivo: 'engenharia' };\n  if (temTermo(t, FORA_AREA) || temTermo(t, ENG_NAO_TI)) return { ok: false, motivo: 'fora_area' };\n  let tier = null;\n  if (/business develop|sales develop/.test(t)) tier = 3;\n  else if (temTermo(t, T1)) tier = 1; else if (temTermo(t, T2)) tier = 2; else if (temTermo(t, T3)) tier = 3;\n  const entrada = temTermo(t, ENTRADA);\n  if (tier === null && !entrada) return { ok: false, motivo: 'sem_termo' };\n  if (tier === null) tier = 3;\n  return { ok: true, tier, entrada };\n}\n\n// ====== EXECUÇÃO ======\nconst itens = $input.all();\nconst sd = $getWorkflowStaticData('global');\nconst producao = $execution.mode === 'production';\nlet modo = 'diario';\ntry { modo = $('Montar busca').first().json.modo || 'diario'; } catch (e) { }\n\nconst vistos = new Set(Array.isArray(sd.vistos) ? sd.vistos : []);\nconst ordemVistos = Array.isArray(sd.vistos) ? sd.vistos.slice() : [];\nlet fila = Array.isArray(sd.fila) ? sd.fila : [];\nconst marcaVisto = (k) => { if (!vistos.has(k)) { vistos.add(k); ordemVistos.push(k); } };\n\nconst stats = { modo, emails: 0, emailsComErro: 0, extraidas: 0, repetidas: 0, descartadas: 0, novasNaFila: 0, enviadasIA: 0, naFila: 0, porFonte: {} };\nconst hoje = Date.now();\n\nfor (const it of itens) {\n  const j = it.json || {};\n  if (!j.id && !j.text && !j.html) continue; // item vazio (busca sem resultado)\n  stats.emails++;\n  try {\n    const de = (typeof j.from === 'string' ? j.from : (j.from && (j.from.text || (j.from.value && j.from.value[0] && j.from.value[0].address))) || j.From || '').toLowerCase();\n    const assunto = j.subject || j.Subject || '';\n    const data = j.date || (j.internalDate ? new Date(Number(j.internalDate)).toISOString() : null);\n    const texto = j.text || '';\n    const html = j.html || '';\n    let achadas = [];\n    if (de.includes('linkedin')) {\n      achadas = parseLinkedIn(/jobs\\/view\\//.test(texto) ? texto : htmlParaTexto(html), {});\n    } else if (de.includes('glassdoor')) {\n      achadas = parseGlassdoor(/jobListingId=/.test(texto) ? texto : htmlParaMd(html), {});\n    } else if (de.includes('match.indeed')) {\n      achadas = parseIndeedMatch(texto.length > 100 ? texto : htmlParaTexto(html), { subject: assunto });\n    } else if (de.includes('indeed')) {\n      achadas = parseIndeedAlerta(/[?&]jk=/.test(texto) ? texto : htmlParaTexto(html), {});\n    }\n    for (const v of achadas) {\n      stats.extraidas++;\n      stats.porFonte[v.source] = (stats.porFonte[v.source] || 0) + 1;\n      v.description = (v.description || '').slice(0, SNIPPET_MAX);\n      v.emailDate = data;\n      v.emailId = j.id;\n      v.beneficios = v.beneficios || [];\n      v.sig = 'sg:' + hash(norm(v.title).replace(/[^a-z0-9]+/g, ' ').trim() + '|' + norm(v.companyName).replace(/[^a-z0-9]+/g, ' ').trim() + '|' + norm((v.location || '').split(',')[0]).replace(/ e regiao.*$/, '').trim());\n      if (vistos.has(v.key) || vistos.has(v.sig)) { stats.repetidas++; continue; }\n      marcaVisto(v.key); marcaVisto(v.sig);\n      const tr = triagem(v);\n      if (!tr.ok) { stats.descartadas++; continue; }\n      v.tier = tr.tier; v.entrada = tr.entrada;\n      v.enfileiradaEm = hoje;\n      fila.push(v);\n      stats.novasNaFila++;\n    }\n  } catch (e) {\n    stats.emailsComErro++;\n  }\n}\n\n// validade da fila\nconst limite = DIAS_VALIDADE * 86400000;\nfila = fila.filter(v => (hoje - (v.enfileiradaEm || hoje)) < limite && ((v.ageDays || 0) + (hoje - (v.enfileiradaEm || hoje)) / 86400000) < DIAS_VALIDADE);\n\n// ordem: tier (dados > TI > outras), nível de entrada primeiro, mais novas primeiro\nconst chave = (v) => v.tier + (v.entrada ? 0 : 0.5);\nfila.sort((a, b) => (chave(a) - chave(b)) || ((a.ageDays ?? 99) - (b.ageDays ?? 99)) || (new Date(b.emailDate || 0) - new Date(a.emailDate || 0)));\n\nconst qtd = producao ? LIMITE_IA_POR_RODADA : LIMITE_TESTE;\nconst hojeLista = fila.slice(0, qtd);\nfila = fila.slice(qtd);\nif (fila.length > MAX_FILA) fila = fila.slice(0, MAX_FILA);\n\nstats.enviadasIA = hojeLista.length;\nstats.naFila = fila.length;\nstats.producao = producao;\n\nsd.vistos = ordemVistos.slice(-MAX_VISTOS);\nsd.fila = fila;\n\nif (!hojeLista.length) return [{ json: { _vazio: true, _stats: stats } }];\nreturn hojeLista.map((v, i) => ({ json: { ...v, ...(i === 0 ? { _stats: stats } : {}) } }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        11776,
+        3632
+      ],
+      "id": "1291950e-0a8d-45c4-8eab-4c31ec71b7ac",
+      "name": "Extrair e enfileirar"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "6a033aa6-4a37-4f5d-ab19-d96d69524c4a",
+              "leftValue": "={{ !!$json._vazio }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        12048,
+        3632
+      ],
+      "id": "0e831668-f4df-4501-a9d6-d8d570c2368b",
+      "name": "Tem vaga?"
+    },
+    {
+      "parameters": {
+        "chatId": "SEU_CHAT_ID_DO_TELEGRAM",
+        "text": "=⚠️ *Vagas por Email não conseguiu ler o Gmail.*\nMotivo: {{ (typeof $json.error === 'string' ? $json.error : ($json.error && $json.error.message) || 'erro desconhecido').toString().replace(/[*_`\\[\\]]/g, '').slice(0, 300) }}\n\nSe o app do Google ainda está em modo Teste, o acesso expira a cada 7 dias: abra a credencial do Gmail no n8n e clique em *Sign in with Google* de novo.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        11776,
+        3856
+      ],
+      "id": "d7d47592-cd14-4196-bf49-b891032d7425",
+      "name": "Aviso erro Gmail",
+      "webhookId": "7bedad7f-02db-4dfa-aef2-44d710b5f123",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== IDS PARA MARCAR =====\n// Lista os emails lidos para o Gmail colocar o rótulo \"Vagas-processado\".\n// Só marca em execução de verdade (agendada/webhook). Em teste manual não marca nada,\n// porque a fila de vagas só é gravada de forma permanente fora do teste.\nif ($execution.mode !== 'production') return [];\nlet emails = [];\ntry { emails = $('Buscar emails').all(); } catch (e) { return []; }\nconst ids = [...new Set(emails.map(e => e.json && e.json.id).filter(Boolean))];\nreturn ids.map(id => ({ json: { messageId: id } }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        12560,
+        3888
+      ],
+      "id": "dc61db17-55f7-4134-90b3-ba07d66d8a86",
+      "name": "IDs para marcar"
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $('IDs para marcar').item.json.messageId }}",
+        "labelIds": [
+          "ID_DA_ETIQUETA_VAGAS_PROCESSADO",
+          "ID_DA_ETIQUETA_TRABALHO"
+        ]
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        12816,
+        3888
+      ],
+      "id": "d8c6b7e7-a942-45d2-9255-a912eb82900d",
+      "name": "Marcar processado",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "webhookId": "d583834d-013a-4ce7-bc9b-160a26f5d1e3",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== MONTAR RESUMO =====\n// Gera um aviso curto no Telegram: sempre no backfill; no diário só se houver erro de leitura.\nconst it = $input.first().json || {};\nconst s = it._stats;\nif (!s) return [];\nif (s.modo !== 'backfill' && !s.emailsComErro) return [];\nconst fonte = Object.entries(s.porFonte || {}).map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v}`).join(' · ') || '—';\nlet t = s.modo === 'backfill' ? '📦 *Backfill de vagas por email*\\n' : '⚙️ *Vagas por Email — aviso*\\n';\nt += `📧 Emails lidos: ${s.emails}\\n🔎 Vagas extraídas: ${s.extraidas} (${fonte})\\n♻️ Repetidas: ${s.repetidas} · 🗑 Descartadas pelo título: ${s.descartadas}\\n`;\nt += `🆕 Novas na fila: ${s.novasNaFila}\\n🤖 Analisadas agora: ${s.enviadasIA} · ⏳ Ainda na fila: ${s.naFila}`;\nif (s.naFila > 0) t += '\\n(o que ficou na fila é analisado nas próximas execuções, 50 vagas por vez)';\nif (s.emailsComErro) t += `\\n⚠️ Emails com erro de leitura: ${s.emailsComErro}`;\nif (!s.producao) t += '\\n🧪 Execução de teste: nada foi gravado.';\nreturn [{ json: { texto: t } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        12048,
+        3344
+      ],
+      "id": "cde6ed4e-fd07-42fd-bd51-852d2a036761",
+      "name": "Montar resumo"
+    },
+    {
+      "parameters": {
+        "chatId": "SEU_CHAT_ID_DO_TELEGRAM",
+        "text": "={{ $json.texto }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        12304,
+        3344
+      ],
+      "id": "3745136f-863c-475a-ad1e-b8814f763aab",
+      "name": "Resumo Telegram",
+      "webhookId": "d91ff480-1f20-4dec-8f19-3a5411e7a274",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        12304,
+        3632
+      ],
+      "id": "6b777533-77b3-4d44-bc6f-65d838c855a8",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.fetchUrl || $json.link }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "pt-BR,pt;q=0.9,en;q=0.5"
+            }
+          ]
+        },
+        "options": {
+          "redirect": {
+            "redirect": {
+              "maxRedirects": 5
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "text",
+              "outputPropertyName": "html"
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        12560,
+        3632
+      ],
+      "id": "5d9f2990-c906-4ab5-9111-eefe808a75b4",
+      "name": "Abrir vaga",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ===== MONTAR TEXTO DA VAGA =====\n// Junta o que veio da página da vaga (HTTP) com o que veio no email.\n// Se a página não abriu (login, bloqueio), usa só o trecho do email e avisa a IA.\nconst DESCRICAO_MAX = 1800;\n\nconst job = $('Loop Over Items').item.json;\nconst resp = $json || {};\nconst html = typeof resp.html === 'string' ? resp.html : (typeof resp.data === 'string' ? resp.data : '');\n\nconst decode = (s) => (s || '').replace(/&nbsp;/g, ' ').replace(/&quot;/g, '\"').replace(/&#0?39;|&apos;/g, \"'\").replace(/&lt;/g, '<').replace(/&gt;/g, '>')\n  .replace(/&#(\\d+);/g, (m, n) => String.fromCharCode(parseInt(n, 10))).replace(/&amp;/g, '&');\nconst semTags = (s) => decode((s || '')\n  .replace(/<(script|style)[\\s\\S]*?<\\/\\1>/gi, '')\n  .replace(/<li[^>]*>/gi, '\\n• ').replace(/<br\\s*\\/?>|<\\/(p|div|li|ul|h\\d|tr)>/gi, '\\n')\n  .replace(/<[^>]+>/g, ' '))\n  .replace(/[ \\t ]+/g, ' ').replace(/\\n\\s*\\n+/g, '\\n').trim();\n\nlet pagina = '', salMin = null, salMax = null, remotoPagina = false;\nif (html && html.length > 500 && !/authwall|captcha|are you a human|just a moment|acesso negado|access denied/i.test(html.slice(0, 6000))) {\n  // 1) JSON-LD (LinkedIn e outros)\n  for (const m of html.matchAll(/<script[^>]*application\\/ld\\+json[^>]*>([\\s\\S]*?)<\\/script>/gi)) {\n    try {\n      const o = JSON.parse(m[1]);\n      const p = [].concat(o, o['@graph'] || []).find(x => x && /JobPosting/i.test(x['@type'] || ''));\n      if (p) {\n        if (p.description) pagina = semTags(decode(p.description));\n        const bs = p.baseSalary && p.baseSalary.value;\n        if (bs && (bs.minValue || bs.value)) {\n          const mult = /year/i.test(bs.unitText || '') ? 1 / 12 : /hour/i.test(bs.unitText || '') ? 176 : /week/i.test(bs.unitText || '') ? 4.33 : /day/i.test(bs.unitText || '') ? 22 : 1;\n          salMin = Math.round(Number(bs.minValue || bs.value) * mult); salMax = Math.round(Number(bs.maxValue || bs.minValue || bs.value) * mult);\n        }\n        if (/TELECOMMUTE/i.test(p.jobLocationType || '')) remotoPagina = true;\n        break;\n      }\n    } catch (e) { }\n  }\n  // 2) blocos conhecidos de descrição\n  if (pagina.length < 150) {\n    const padroes = [\n      /<div[^>]*class=\"[^\"]*show-more-less-html__markup[^\"]*\"[^>]*>([\\s\\S]*?)<\\/div>/i,\n      /<div[^>]*id=\"jobDescriptionText\"[^>]*>([\\s\\S]*?)<\\/div>\\s*<\\/div>/i,\n      /<div[^>]*data-test=\"jobDescription[^\"]*\"[^>]*>([\\s\\S]*?)<\\/div>/i\n    ];\n    for (const re of padroes) { const m = html.match(re); if (m && semTags(m[1]).length > 150) { pagina = semTags(m[1]); break; } }\n  }\n  // 3) meta description\n  if (pagina.length < 150) {\n    const m = html.match(/<meta[^>]*(?:property=\"og:description\"|name=\"description\")[^>]*content=\"([^\"]*)\"/i) || html.match(/<meta[^>]*content=\"([^\"]*)\"[^>]*(?:property=\"og:description\"|name=\"description\")/i);\n    if (m && decode(m[1]).length > 120) pagina = decode(m[1]);\n  }\n}\n\n// Critérios que o LinkedIn mostra na página (nível de experiência, tipo de emprego, função, setor)\nconst criterios = [...(html || '').matchAll(/description__job-criteria-text[^>]*>\\s*([^<]{2,60}?)\\s*</gi)].map(m => decode(m[1]).trim()).filter(Boolean).slice(0, 4);\n\nconst emailTxt = (job.description || '').trim();\nlet textoVaga = '', fonteTexto = 'email';\nif (pagina.length >= 150) { textoVaga = pagina; fonteTexto = 'pagina'; }\nelse { textoVaga = emailTxt; }\ntextoVaga = textoVaga.slice(0, DESCRICAO_MAX);\n\nconst sMin = job.salaryMin || salMin || null, sMax = job.salaryMax || salMax || null;\nconst infoExtra = [\n  `Fonte: ${job.source}${job.rating ? ' (nota da empresa ' + job.rating + ')' : ''}`,\n  job.ageDays != null ? `Publicada há ${job.ageDays} dia(s)` : '',\n  sMin ? `Salário informado: R$ ${sMin}${sMax && sMax !== sMin ? ' a R$ ' + sMax : ''} por mês` : '',\n  (job.beneficios || []).length ? `Benefícios informados: ${job.beneficios.join(', ')}` : '',\n  criterios.length ? `Critérios do LinkedIn: ${criterios.join(' | ')}` : '',\n  (job.modalidade || remotoPagina) ? `Modalidade informada: ${job.modalidade || 'remoto'}` : '',\n  fonteTexto === 'email' ? 'ATENÇÃO: só há o trecho do email (a página da vaga não abriu); a descrição pode estar incompleta.' : ''\n].filter(Boolean).join('\\n');\n\nreturn {\n  json: {\n    ...job,\n    salaryMin: sMin, salaryMax: sMax,\n    modalidade: job.modalidade || (remotoPagina ? 'remoto' : null),\n    textoVaga, fonteTexto, infoExtra,\n    descricaoCurta: textoVaga.length < 100 && job.source !== 'indeed_match'\n  }\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        12816,
+        3632
+      ],
+      "id": "2abde6b9-34aa-42c2-a75b-471a0d356222",
+      "name": "Montar texto"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Você é um recrutador de TI. Leia a vaga abaixo e extraia FATOS sobre ela comparando com o perfil do candidato. NÃO calcule nota. Use somente o perfil e a vaga; não invente requisitos, salário nem benefícios.\n\nPERFIL DO CANDIDATO — <<PREENCHA COM OS SEUS DADOS>>:\n- Busca: <<tipo de vaga e áreas de interesse>>.\n- Formação: <<curso, nível e ano de conclusão ou previsão>>.\n- Habilidades por nível:\n  * Intermediário: <<...>>\n  * Básico/iniciante: <<...>>\n  * Em estudo: <<...>>\n  * Não tem: <<ferramentas que as vagas costumam pedir e você não tem>>.\n- Projeto: <<seu projeto principal, com as tecnologias usadas>>.\n- Experiência real: <<suas experiências reais, sem inventar cargo>>.\n- Local: <<cidade/região e se aceita remoto>>.\n\nDADOS DA VAGA:\nVaga: {{ $json.title }}\nEmpresa: {{ $json.companyName }}\nLocal: {{ $json.location }}\n{{ $json.infoExtra }}\nDescrição:\n{{ $json.textoVaga || '(sem descrição disponível — avalie pelo título)' }}\n\nCOMO PREENCHER:\n- requisitos_faltantes: só requisitos OBRIGATÓRIOS (ou fortemente exigidos) que o candidato NÃO tem. Habilidade de nível básico conta como \"tem\" quando a vaga pede básico, noções ou conhecimento; se a vaga pede nível sólido, avançado ou experiência comprovada, é faltante. Itens \"desejável\" ou \"diferencial\" não entram. Conceitos genéricos (dashboards, relatórios, KPIs, indicadores, análise de dados) não são ferramentas: nunca os liste como faltantes; liste só tecnologias/ferramentas específicas (ex.: Power BI, Snowflake).\n- requisitos_em_estudo: requisitos obrigatórios que o candidato está estudando (lista \"Em estudo\").\n- anos_exigidos: anos de experiência exigidos na área; 0 se não exige.\n- formatura_exigida_ate: ano limite de conclusão da graduação que o programa exige (ex.: \"formandos até dez/2027\" = 2027); null se não houver.\n- curso_exigido_incompativel: true somente se a vaga exige estar cursando ou ter curso superior específico fora de TI/computação/engenharia de software/dados/sistemas.\n- area: escolha UMA entre dados, ia, automacao, suporte, qa, dev, ti_geral, atendimento, comercial, logistica, administrativo, dp_contabil_financeiro, engenharia_nao_ti, outra_formacao, outro.\n- nivel: estagio, trainee, junior, assistente, pleno, senior, lideranca ou indefinido.\n- formato: remoto, hibrido, presencial ou indefinido. cidade: cidade/UF da vaga, ou \"Brasil\" se remoto.\n- salario_mensal_min e salario_mensal_max: em reais por mês, apenas se a vaga informar; senão null.\n- beneficios: benefícios citados na vaga (máximo 6, itens curtos).\n- experiencias_ligadas: use somente estes códigos, quando a vaga tiver relação clara com a experiência real do candidato: planilhas_excel, controle_processos, atendimento, digitalizacao, registro_sistemas, contratos_propostas.\n- cv_sugerido: Dados, QA, Suporte, Trainee ou Ingles (Ingles só se a vaga for em inglês).\n- Se a descrição for curta ou ausente (só o título), NÃO invente requisitos: deixe requisitos_faltantes, requisitos_em_estudo e experiencias_ligadas vazios, marque false em pede_excel, pede_python_ou_analise_basico, aceita_iniciante e programa_estruturado, e diga isso no resumo_vaga.\n- Um mesmo item nunca aparece em requisitos_faltantes e em requisitos_em_estudo ao mesmo tempo: se o candidato estuda a tecnologia (ex.: SQL), ela vai só em requisitos_em_estudo.\n- experiencias_ligadas: só inclua um código se a descrição da vaga citar claramente aquela atividade.\n- pontos_fortes: itens curtos do perfil que a vaga realmente pede, SEM adjetivos de nível. Nunca escreva \"avançado\", \"sólido\" ou \"expert\"; use o nível descrito no PERFIL.\n\nResponda EXCLUSIVAMENTE em JSON puro, em português, neste formato (listas com no máximo 5 itens curtos; resumo_vaga com no máximo 2 frases):\n{\n  \"area\": \"\",\n  \"nivel\": \"\",\n  \"anos_exigidos\": 0,\n  \"formatura_exigida_ate\": null,\n  \"curso_exigido_incompativel\": false,\n  \"formato\": \"\",\n  \"cidade\": \"\",\n  \"salario_mensal_min\": null,\n  \"salario_mensal_max\": null,\n  \"beneficios\": [],\n  \"requisitos_faltantes\": [],\n  \"requisitos_em_estudo\": [],\n  \"pede_excel\": false,\n  \"pede_python_ou_analise_basico\": false,\n  \"aceita_iniciante\": false,\n  \"programa_estruturado\": false,\n  \"experiencias_ligadas\": [],\n  \"cv_sugerido\": \"\",\n  \"pontos_fortes\": [],\n  \"resumo_vaga\": \"\"\n}\n",
+        "messages": {
+          "messageValues": []
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        13088,
+        3632
+      ],
+      "id": "ea766ffe-5490-4fdb-9125-92f6adaa1045",
+      "name": "Basic LLM Chain",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 3,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-20b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        13088,
+        3856
+      ],
+      "id": "cbf56022-b9a7-42f9-aad2-a9c2bce5eda8",
+      "name": "Groq Chat Model"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "6ec335ce-9acd-4398-945d-609a01374f52",
+              "leftValue": "={{ !!($json.text && String($json.text).trim().length > 5) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        13248,
+        3632
+      ],
+      "id": "5627afb1-1e66-4e23-a415-85bb6a2f28d9",
+      "name": "IA respondeu?"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Você é um recrutador de TI. Leia a vaga abaixo e extraia FATOS sobre ela comparando com o perfil do candidato. NÃO calcule nota. Use somente o perfil e a vaga; não invente requisitos, salário nem benefícios.\n\nPERFIL DO CANDIDATO — <<PREENCHA COM OS SEUS DADOS>>:\n- Busca: <<tipo de vaga e áreas de interesse>>.\n- Formação: <<curso, nível e ano de conclusão ou previsão>>.\n- Habilidades por nível:\n  * Intermediário: <<...>>\n  * Básico/iniciante: <<...>>\n  * Em estudo: <<...>>\n  * Não tem: <<ferramentas que as vagas costumam pedir e você não tem>>.\n- Projeto: <<seu projeto principal, com as tecnologias usadas>>.\n- Experiência real: <<suas experiências reais, sem inventar cargo>>.\n- Local: <<cidade/região e se aceita remoto>>.\n\nDADOS DA VAGA:\nVaga: {{ $('Montar texto').item.json.title }}\nEmpresa: {{ $('Montar texto').item.json.companyName }}\nLocal: {{ $('Montar texto').item.json.location }}\n{{ $('Montar texto').item.json.infoExtra }}\nDescrição:\n{{ $('Montar texto').item.json.textoVaga || '(sem descrição disponível — avalie pelo título)' }}\n\nCOMO PREENCHER:\n- requisitos_faltantes: só requisitos OBRIGATÓRIOS (ou fortemente exigidos) que o candidato NÃO tem. Habilidade de nível básico conta como \"tem\" quando a vaga pede básico, noções ou conhecimento; se a vaga pede nível sólido, avançado ou experiência comprovada, é faltante. Itens \"desejável\" ou \"diferencial\" não entram. Conceitos genéricos (dashboards, relatórios, KPIs, indicadores, análise de dados) não são ferramentas: nunca os liste como faltantes; liste só tecnologias/ferramentas específicas (ex.: Power BI, Snowflake).\n- requisitos_em_estudo: requisitos obrigatórios que o candidato está estudando (lista \"Em estudo\").\n- anos_exigidos: anos de experiência exigidos na área; 0 se não exige.\n- formatura_exigida_ate: ano limite de conclusão da graduação que o programa exige (ex.: \"formandos até dez/2027\" = 2027); null se não houver.\n- curso_exigido_incompativel: true somente se a vaga exige estar cursando ou ter curso superior específico fora de TI/computação/engenharia de software/dados/sistemas.\n- area: escolha UMA entre dados, ia, automacao, suporte, qa, dev, ti_geral, atendimento, comercial, logistica, administrativo, dp_contabil_financeiro, engenharia_nao_ti, outra_formacao, outro.\n- nivel: estagio, trainee, junior, assistente, pleno, senior, lideranca ou indefinido.\n- formato: remoto, hibrido, presencial ou indefinido. cidade: cidade/UF da vaga, ou \"Brasil\" se remoto.\n- salario_mensal_min e salario_mensal_max: em reais por mês, apenas se a vaga informar; senão null.\n- beneficios: benefícios citados na vaga (máximo 6, itens curtos).\n- experiencias_ligadas: use somente estes códigos, quando a vaga tiver relação clara com a experiência real do candidato: planilhas_excel, controle_processos, atendimento, digitalizacao, registro_sistemas, contratos_propostas.\n- cv_sugerido: Dados, QA, Suporte, Trainee ou Ingles (Ingles só se a vaga for em inglês).\n- Se a descrição for curta ou ausente (só o título), NÃO invente requisitos: deixe requisitos_faltantes, requisitos_em_estudo e experiencias_ligadas vazios, marque false em pede_excel, pede_python_ou_analise_basico, aceita_iniciante e programa_estruturado, e diga isso no resumo_vaga.\n- Um mesmo item nunca aparece em requisitos_faltantes e em requisitos_em_estudo ao mesmo tempo: se o candidato estuda a tecnologia (ex.: SQL), ela vai só em requisitos_em_estudo.\n- experiencias_ligadas: só inclua um código se a descrição da vaga citar claramente aquela atividade.\n- pontos_fortes: itens curtos do perfil que a vaga realmente pede, SEM adjetivos de nível. Nunca escreva \"avançado\", \"sólido\" ou \"expert\"; use o nível descrito no PERFIL.\n\nResponda EXCLUSIVAMENTE em JSON puro, em português, neste formato (listas com no máximo 5 itens curtos; resumo_vaga com no máximo 2 frases):\n{\n  \"area\": \"\",\n  \"nivel\": \"\",\n  \"anos_exigidos\": 0,\n  \"formatura_exigida_ate\": null,\n  \"curso_exigido_incompativel\": false,\n  \"formato\": \"\",\n  \"cidade\": \"\",\n  \"salario_mensal_min\": null,\n  \"salario_mensal_max\": null,\n  \"beneficios\": [],\n  \"requisitos_faltantes\": [],\n  \"requisitos_em_estudo\": [],\n  \"pede_excel\": false,\n  \"pede_python_ou_analise_basico\": false,\n  \"aceita_iniciante\": false,\n  \"programa_estruturado\": false,\n  \"experiencias_ligadas\": [],\n  \"cv_sugerido\": \"\",\n  \"pontos_fortes\": [],\n  \"resumo_vaga\": \"\"\n}\n",
+        "messages": {
+          "messageValues": []
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        13248,
+        3856
+      ],
+      "id": "e574dbb0-c0a0-4911-8913-48077b6dda71",
+      "name": "Basic LLM Chain reserva",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 2,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-120b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        13248,
+        4064
+      ],
+      "id": "7b5a33df-3dfa-4e95-8631-8576307f64ae",
+      "name": "Groq Chat Model reserva"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ===== CALCULA SCORE (Code in JavaScript1) =====\n// A IA devolve só FATOS sobre a vaga. A nota é calculada aqui, com regras fixas e visíveis.\n// Começa em 100 e desconta o que atrapalha. Dois tipos de desconto:\n//  - IMPEDITIVO (pleno/sênior, formatura exigida, outra formação, fora de BH...): nenhum bônus compensa.\n//  - COMPENSÁVEL (requisito faltando, área fora de TI mas compatível, salário baixo...): bônus (até +30) recuperam pontos.\n\n// ====== CONFIGURAÇÃO ======\nconst CORTE = 60;                 // nota mínima para ir ao Telegram\nconst SALARIO_MINIMO = 0;        // AJUSTE: abaixo disso aparece aviso e desconto (0 desliga)\n    const ANO_FORMATURA = 2030;      // AJUSTE: ano da sua formatura (vagas que exigem formatura antes são penalizadas)\nconst BONUS_MAX = 30;\nconst AREAS_TI = ['dados', 'ia', 'automacao', 'suporte', 'qa', 'dev', 'ti_geral'];\nconst AREAS_MEIO = ['atendimento', 'comercial', 'logistica', 'administrativo', 'dp_contabil_financeiro'];\nconst BAIRROS_RMBH = ['contagem', 'betim', 'nova lima', 'sabara', 'santa luzia', 'ribeirao das neves', 'vespasiano', 'lagoa santa', 'ibirite', 'sarzedo', 'esmeraldas'];\nconst EXPERIENCIAS = {\n  planilhas_excel: 'Excel/planilhas', controle_processos: 'controle de processos', atendimento: 'atendimento',\n  digitalizacao: 'digitalização de processos', registro_sistemas: 'registro em sistemas', contratos_propostas: 'contratos/propostas'\n};\nconst CVS = {\n  Dados: 'Dados e Operações (DV3)', QA: 'QA / Processos / TI Geral (QATV3)', Suporte: 'Suporte / Service Desk (SOV3)',\n  Trainee: 'Trainee e Entrada em TI', Ingles: 'English IT Support (Resume)'\n};\n\nconst norm = (s) => (s || '').toString().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');\nconst limpa = (s) => (s || '').toString().replace(/[*_`\\[\\]]/g, '').replace(/\\s+/g, ' ').trim();\nconst lista = (v) => (Array.isArray(v) ? v : (v ? [v] : [])).map(limpa).filter(Boolean);\nconst reais = (n) => 'R$ ' + Math.round(n).toLocaleString('pt-BR');\n\n// 1. Resposta da IA\nlet raw = ($json.text || '').replace(/```json/gi, '').replace(/```/g, '').trim();\nconst i0 = raw.indexOf('{'), i1 = raw.lastIndexOf('}');\nif (i0 !== -1 && i1 > i0) raw = raw.slice(i0, i1 + 1);\n// Se o JSON vier com defeito (aspas soltas, vírgula sobrando), tenta consertar antes de desistir\nconst tentaParse = (t) => { try { return JSON.parse(t); } catch (e) { return null; } };\nfunction salvar(t) {\n  const o = tentaParse(t.replace(/[“”]/g, '\"').replace(/,\\s*([}\\]])/g, '$1'));\n  if (o) return o;\n  const str = (k) => { const m = t.match(new RegExp('\"' + k + '\"\\\\s*:\\\\s*\"([^\"]*)\"')); return m ? m[1] : ''; };\n  const num = (k) => { const m = t.match(new RegExp('\"' + k + '\"\\\\s*:\\\\s*(-?\\\\d+(?:\\\\.\\\\d+)?)')); return m ? Number(m[1]) : null; };\n  const bool = (k) => new RegExp('\"' + k + '\"\\\\s*:\\\\s*true').test(t);\n  const arr = (k) => { const m = t.match(new RegExp('\"' + k + '\"\\\\s*:\\\\s*\\\\[([^\\\\]]*)\\\\]')); return m ? [...m[1].matchAll(/\"([^\"]+)\"/g)].map(x => x[1]) : []; };\n  if (!str('area')) return null;\n  const rm = t.match(/\"resumo_vaga\"\\s*:\\s*\"([\\s\\S]*?)\"\\s*}?\\s*$/);\n  return {\n    area: str('area'), nivel: str('nivel'), anos_exigidos: num('anos_exigidos') || 0, formatura_exigida_ate: num('formatura_exigida_ate'),\n    curso_exigido_incompativel: bool('curso_exigido_incompativel'), formato: str('formato'), cidade: str('cidade'),\n    salario_mensal_min: num('salario_mensal_min'), salario_mensal_max: num('salario_mensal_max'),\n    beneficios: arr('beneficios'), requisitos_faltantes: arr('requisitos_faltantes'), requisitos_em_estudo: arr('requisitos_em_estudo'),\n    pede_excel: bool('pede_excel'), pede_python_ou_analise_basico: bool('pede_python_ou_analise_basico'),\n    aceita_iniciante: bool('aceita_iniciante'), programa_estruturado: bool('programa_estruturado'),\n    experiencias_ligadas: arr('experiencias_ligadas'), cv_sugerido: str('cv_sugerido'), pontos_fortes: arr('pontos_fortes'),\n    resumo_vaga: rm ? rm[1].replace(/\\\\\"/g, '\"') : ''\n  };\n}\nlet ai = {}, erroIA = false;\nconst motivoErro = !raw ? 'resposta vazia da IA (possível limite do Groq)' : 'resposta da IA fora do formato';\nai = salvar(raw);\nif (!ai) { ai = {}; erroIA = true; }\n\n// 2. Dados da vaga (já com o que veio do email/página)\nconst job = $('Montar texto').item.json;\n\n// 3. Pontuação\nconst ded = [], bon = [];\nconst D = (v, m, duro) => ded.push([v, m, !!duro]);\nconst B = (v, m) => bon.push([v, m]);\nconst avisos = [];\n\nconst area = norm(ai.area);\nconst nivel = norm(ai.nivel);\nconst anos = Number(ai.anos_exigidos) || 0;\nconst emEstudo = lista(ai.requisitos_em_estudo);\n// um mesmo item não pode contar como \"falta\" e \"em estudo\" ao mesmo tempo\nconst faltantes = lista(ai.requisitos_faltantes).filter(f => !emEstudo.some(e => norm(e).includes(norm(f)) || norm(f).includes(norm(e))));\n// sem descrição, a IA não tem base para afirmar requisitos nem experiências: ignora\nconst temDescricao = !job.descricaoCurta;\n\nif (!erroIA) {\n  // Área: as áreas que ele quer NÃO perdem ponto\n  if (AREAS_MEIO.includes(area)) D(20, 'área fora de TI, mas compatível');\n  else if (area === 'engenharia_nao_ti') D(60, 'engenharia fora de software', true);\n  else if (area === 'outra_formacao') D(70, 'exige formação de outra área', true);\n  else if (!AREAS_TI.includes(area)) D(45, 'área fora do perfil', true);\n\n  // Nível / experiência\n  if (['pleno', 'senior', 'lideranca'].includes(nivel) || anos >= 3) D(50, 'pede pleno/sênior ou 3+ anos', true);\n  else if (anos >= 1) D(10, `pede ${anos} ano(s) de experiência`);\n\n  // Elegibilidade\n  const form = Number(ai.formatura_exigida_ate);\n  if (isFinite(form) && form > 0 && form < ANO_FORMATURA) D(45, `exige formatura até ${form} (sua previsão: ${ANO_FORMATURA})`, true);\n  if (ai.curso_exigido_incompativel === true) D(40, 'exige curso superior de outra área', true);\n\n  // Requisitos técnicos\n  if (faltantes.length && temDescricao) D(Math.min(faltantes.length, 5) * 4, `${faltantes.length} requisito(s) que faltam`);\n  if (emEstudo.length && temDescricao) D(Math.min(emEstudo.length, 4) * 2, `${emEstudo.length} requisito(s) em estudo`);\n}\n\n// Modalidade e local (por regras, não pela IA)\nconst locTxt = norm(job.location) || norm(ai.cidade);\nconst modEmail = job.modalidade || null;\nconst modIA = norm(ai.formato);\nlet modalidade = modEmail || (['remoto', 'hibrido', 'presencial'].includes(modIA) ? modIA : null);\nif (/remot|home office|trabalho a distancia/.test(locTxt)) modalidade = 'remoto';\nif (modalidade !== 'remoto' && locTxt.trim()) {\n  if (/belo horizonte|\\bbh\\b/.test(locTxt)) { /* ok */ }\n  else if (BAIRROS_RMBH.some(c => locTxt.includes(c))) D(6, 'região metropolitana de BH');\n  else if (/^(brasil|brazil)$/.test(locTxt.trim())) { /* local genérico: não penaliza */ }\n  else if (/\\b(mg|minas gerais)\\b/.test(locTxt)) D(45, 'presencial/híbrido em outra cidade de MG', true);\n  else D(45, 'fora de BH e não é remoto', true);\n}\n\n// Descrição\nif (job.descricaoCurta) D(10, 'sem descrição suficiente (nota limitada)', true);\n\n// Salário\nconst num = (x) => { const n = Number(x); return isFinite(n) && n >= 500 && n <= 100000 ? n : null; };\nconst sMin = num(job.salaryMin) || num(ai.salario_mensal_min);\nconst sMax = num(job.salaryMax) || num(ai.salario_mensal_max) || sMin;\nconst sRef = sMin ? (sMin + (sMax || sMin)) / 2 : null;\nif (sMin !== null) {\n  if (sMin < SALARIO_MINIMO) { D(10, `salário abaixo de ${reais(SALARIO_MINIMO)}`, true); avisos.push(`⚠️ Abaixo do mínimo: ${reais(sMin)}`); }\n  else if (sMin < 3500) D(4, 'salário de 2.500 a 3.499', true);\n}\n\n// Bônus\nif (!erroIA) {\n  if (modalidade === 'remoto') B(10, 'home office');\n  else if (modalidade === 'hibrido') B(3, 'híbrido');\n  if (sRef !== null) {\n    if (sRef >= 12000) B(16, 'salário ≥ 12 mil');\n    else if (sRef >= 6000) B(14, 'salário de 6 a 12 mil');\n    else if (sRef >= 5000) B(8, 'salário de 5 a 6 mil');\n    else if (sRef >= 3500) B(5, 'salário ≥ 3,5 mil');\n  }\n  const todosBen = [...lista(job.beneficios), ...lista(ai.beneficios)];\n  const benUnicos = [];\n  for (const b of todosBen) { const k = norm(b); if (/vale.?transporte|^vt$/.test(k)) continue; if (!benUnicos.some(x => norm(x) === k)) benUnicos.push(b); }\n  if (benUnicos.length) B(Math.min(benUnicos.length, 4) * 2, `${Math.min(benUnicos.length, 4)} benefício(s)`);\n  const exps = temDescricao ? lista(ai.experiencias_ligadas).map(norm).filter(k => EXPERIENCIAS[k]) : [];\n  const expsUn = [...new Set(exps)];\n  if (expsUn.length) B(Math.min(expsUn.length, 3) * 3, 'experiência que você já tem: ' + expsUn.slice(0, 3).map(k => EXPERIENCIAS[k]).join(', '));\n  if (temDescricao && ai.pede_excel === true) B(4, 'pede Excel');\n  if (temDescricao && ai.pede_python_ou_analise_basico === true) B(3, 'Python/análise básico');\n  if (temDescricao && ai.aceita_iniciante === true) B(4, 'aceita iniciante');\n  if (temDescricao && ai.programa_estruturado === true) B(4, 'programa estruturado');\n  if (job.rating && job.rating >= 4.0) B(3, `empresa nota ${job.rating}`);\n  if (job.ageDays != null && job.ageDays <= 3) B(3, 'vaga recente');\n}\n\nconst dedDuro = ded.filter(x => x[2]).reduce((a, x) => a + x[0], 0);\nconst dedMole = ded.filter(x => !x[2]).reduce((a, x) => a + x[0], 0);\nconst totalBon = Math.min(bon.reduce((a, x) => a + x[0], 0), BONUS_MAX);\nconst bonusUsado = Math.min(totalBon, dedMole);   // bônus só recupera descontos compensáveis\nconst score = erroIA ? 0 : Math.max(0, Math.min(100, Math.round(100 - dedDuro - dedMole + bonusUsado)));\nconst aprovada = erroIA ? true : score >= CORTE;   // se a IA falhar, avisa para você conferir\nconst forte = !erroIA && dedDuro === 0 && score >= 85 && AREAS_TI.includes(area) && ((sRef !== null && sRef >= 6000) || (sRef !== null && sRef >= 3500 && modalidade === 'remoto'));\n\nif (erroIA) avisos.push(`⚠️ A IA não conseguiu analisar esta vaga (${motivoErro}) — avalie você mesmo.`);\n\n// 4. Textos para o Telegram\nconst fonteNome = { linkedin: '🔎 LinkedIn', glassdoor: '📧 Glassdoor', indeed: '📧 Indeed', indeed_match: '📧 Indeed (sugestão)' }[job.source] || job.source;\nconst idade = job.ageDays == null ? '' : (job.ageDays === 0 ? ' · publicada hoje' : ` · há ${job.ageDays} dia(s)`);\nlet modTxt = { remoto: 'Remoto', hibrido: 'Híbrido', presencial: 'Presencial' }[modalidade] || '';\nif (modTxt && norm(job.location).includes(norm(modTxt))) modTxt = '';   // evita \"Remoto · Remoto\"\nconst salTxt = sMin ? (sMax && sMax !== sMin ? `${reais(sMin)} a ${reais(sMax)}` : reais(sMin)) : 'não informado';\nconst bens = [...new Set([...lista(job.beneficios), ...lista(ai.beneficios)].map(norm))].length\n  ? [...lista(job.beneficios), ...lista(ai.beneficios)].filter((b, i, a) => a.findIndex(x => norm(x) === norm(b)) === i).slice(0, 6).join(', ') : '';\nconst ajustes = [...ded.map(x => `−${x[0]} ${x[1]}`), ...bon.map(x => `+${x[0]} ${x[1]}`)].join(' | ') + (bon.length && dedMole ? ` (bônus aproveitado: +${bonusUsado})` : '');\nconst cv = CVS[ai.cv_sugerido] || CVS[Object.keys(CVS).find(k => norm(k) === norm(ai.cv_sugerido))] || '';\nconst pf = lista(ai.pontos_fortes).slice(0, 4);\nconst rf = faltantes.slice(0, 5);\nconst estudoMostrar = temDescricao ? emEstudo : [];\nconst resumo = limpa(ai.resumo_vaga) || (erroIA ? 'Não foi possível analisar automaticamente.' : '');\n\nlet cab = `🎯 *NOVA VAGA COMPATÍVEL!*${forte ? ' 🔥 *MATCH FORTE*' : ''}\\n`;\ncab += `📌 *Vaga:* ${limpa(job.title) || 'Título não informado'}\\n`;\ncab += `🏢 *Empresa:* ${limpa(job.companyName) || 'Empresa não informada'}\\n`;\ncab += `📍 *Local:* ${limpa(job.location)}${modTxt ? ' · ' + modTxt : ''}\\n`;\ncab += `💰 *Salário:* ${salTxt}\\n`;\nif (bens) cab += `🎁 *Benefícios:* ${limpa(bens)}\\n`;\ncab += `📊 *Score de Aderência:* ${erroIA ? 'n/d' : score + '/100'}\\n`;\nif (cv) cab += `📄 *CV sugerido:* ${cv}\\n`;\ncab += `${fonteNome}${idade}\\n`;\nif (avisos.length) cab += '\\n' + avisos.join('\\n') + '\\n';\nif (resumo) cab += `\\n💡 *Resumo:* _${resumo}_\\n`;\nif (pf.length) cab += `\\n✅ *Pontos Fortes:*\\n• ${pf.join('\\n• ')}\\n`;\nif (rf.length && temDescricao) cab += `\\n⚠️ *Requisitos faltantes:*\\n• ${rf.join('\\n• ')}\\n`;\nif (estudoMostrar.length) cab += `\\n📚 *Você está estudando:* ${estudoMostrar.slice(0, 4).join(', ')}\\n`;\nif (ajustes && !erroIA) cab += `\\n📐 _Ajustes: ${ajustes.slice(0, 320)}_\\n`;\nif (job.fonteTexto === 'email') cab += `\\nℹ️ _A página da vaga não abriu; análise feita com o trecho do email._\\n`;\n\nreturn {\n  json: {\n    jobId: job.rawId || job.key || '',\n    title: limpa(job.title), company: limpa(job.companyName), location: limpa(job.location),\n    url: (job.link || '').replace(/\\)/g, '%29'),\n    score, aprovada, erroIA, forte,\n    pontos_fortes: pf, requisitos_faltantes: rf, resumo_vaga: resumo,\n    ajustes, cabecalho: cab\n  }\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        13408,
+        3632
+      ],
+      "id": "d84627bb-a4c2-4fbf-8622-3fd59fd7e870",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ce6cab0f-f243-4cba-9275-fae9d71a01dc",
+              "leftValue": "={{ $json.aprovada }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        13664,
+        3632
+      ],
+      "id": "b791dbec-ae65-4e05-b582-3aaf2331ffee",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Vaga: {{ $json.title }} na empresa {{ $json.company }}\nResumo da vaga: {{ $json.resumo_vaga }}\nPontos fortes do meu perfil para essa vaga: {{ Array.isArray($json.pontos_fortes) ? $json.pontos_fortes.join(', ') : $json.pontos_fortes }}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "Você escreve cartas de apresentação curtas, em português, para candidaturas a estágio ou vaga júnior. Escreva em primeira pessoa, como o candidato.  DADOS DO CANDIDATO (use somente estas informações) — <<PREENCHA>>:\n- Nome: <<SEU NOME>>\n- GitHub: <<github.com/SEU-USUARIO>>\n- Formação: <<curso, nível e ano>>\n- Técnicas: <<suas habilidades reais>>\n- Projeto: <<seu projeto principal>>\n- Experiência: <<suas experiências reais>>  REGRAS: - Não invente experiência, ferramenta, cargo ou resultado que não esteja nos dados acima. Não diga que já atuou como desenvolvedor ou analista de dados. - Use os pontos fortes e o resumo da vaga recebidos para escolher no máximo 2 itens dos dados acima que sejam relevantes para a vaga. Cite o projeto apenas se a vaga envolver a mesma área dele. Cite atendimento apenas se a vaga envolver atendimento. - Nunca use qualificadores de nível como \"avançado\", \"sólido\" ou \"experiência profissional\" que não estejam nos dados acima; respeite o nível real de cada habilidade e diga corretamente o que já foi concluído e o que está em andamento. - Tom profissional, direto e sem exageros. Não use frases genéricas de elogio à empresa. - Máximo de 110 palavras. - Comece com \"Olá,\" seguido de \"sou SEU NOME\" em minúscula (\"Olá, sou SEU NOME, ...\") e termine com \"Atenciosamente,\" e o nome do candidato, seguido do GitHub. - Texto puro: sem markdown, sem asteriscos, sem sublinhados, sem listas."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        13936,
+        3488
+      ],
+      "id": "aeb7f894-a0e0-4480-804a-7137e71a38f6",
+      "name": "Basic LLM Chain1",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 3,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-120b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        13936,
+        3712
+      ],
+      "id": "ac768ca4-22a9-4b13-a79e-e4eb5bd85720",
+      "name": "Groq Chat Model1"
+    },
+    {
+      "parameters": {
+        "chatId": "SEU_CHAT_ID_DO_TELEGRAM",
+        "text": "={{ $('Code in JavaScript1').item.json.cabecalho }}\n✉️ *Sugestão de Carta de Apresentação:*\n\n{{ ($json.text || '').replace(/[*_`\\[\\]]/g, '').replace(/\\s+(avançad|sólid|expert)[oa]s?/gi, '').replace(/\\s*Atenciosamente,?\\s*SEU NOME\\s*/i, '\\n\\nAtenciosamente,\\nSEU NOME\\n').slice(0, 1200) }}\n\n🔗 [Clique aqui para abrir e aplicar na vaga]({{ $('Code in JavaScript1').item.json.url }})",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        14240,
+        3488
+      ],
+      "id": "e8cdb391-af45-48be-82a0-1d23682c44a2",
+      "name": "Send a text message",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "webhookId": "d95aec15-7b8c-4964-b780-83ffdc0eee55",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "amount": 30
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        14240,
+        3776
+      ],
+      "id": "8901dca8-7c57-4be3-9378-54ab3cf00129",
+      "name": "Wait",
+      "webhookId": "69044ab5-243f-440a-b261-cc7473313d7a"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "limit": 60,
+        "filters": {
+          "q": "in:inbox newer_than:2d -category:promotions -category:social -category:forums subject:(vaga OR vagas OR candidatura OR \"estágio\" OR \"processo seletivo\" OR inscrição OR recrutamento OR \"seleção\")"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        11264,
+        3136
+      ],
+      "id": "2344a8e6-2a70-42ff-8e18-cf3c2231431e",
+      "name": "Buscar remetentes novos",
+      "webhookId": "11b95fa7-3930-4603-8aa2-5d2e3a6b8466",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== REMETENTES NOVOS =====\n// Avisa quando aparece, na caixa de entrada, um remetente de vaga/candidatura que o workflow não conhece.\nconst CONHECIDOS = ['linkedin.com', 'glassdoor.com', 'indeed.com', 'gupy.io', 'gupy.com.br', 'inhire.app', 'solides.com', 'solides.com.br', 'mindsight.com.br', 'vagas.com.br', 'google.com', 'gmail.com', 'accounts.google.com'];\nconst MAX_AVISADOS = 300;\n\nconst sd = $getWorkflowStaticData('global');\nconst avisados = new Set(Array.isArray(sd.remetentesAvisados) ? sd.remetentesAvisados : []);\nconst achados = new Map();\nfor (const it of $input.all()) {\n  const j = it.json || {};\n  if (!j.id) continue;\n  const bruto = typeof j.from === 'string' ? j.from : (j.from && (j.from.text || (j.from.value && j.from.value[0] && j.from.value[0].address))) || j.From || '';\n  const m = String(bruto).toLowerCase().match(/[a-z0-9._%+-]+@([a-z0-9.-]+\\.[a-z]{2,})/);\n  if (!m) continue;\n  const base = m[1];\n  if (CONHECIDOS.some(c => base === c || base.endsWith('.' + c))) continue;\n  if (avisados.has(base)) continue;\n  if (!achados.has(base)) achados.set(base, (j.subject || j.Subject || '').toString().slice(0, 80));\n}\nif (!achados.size) return [];\nconst linhas = [...achados.entries()].slice(0, 12).map(([d, s]) => `• ${d.replace(/[*_`\\[\\]]/g, '')} — ${s.replace(/[*_`\\[\\]]/g, '')}`);\nif ($execution.mode === 'production') {\n  for (const d of achados.keys()) avisados.add(d);\n  sd.remetentesAvisados = [...avisados].slice(-MAX_AVISADOS);\n}\nreturn [{ json: { texto: `📬 *Remetentes novos de vaga/candidatura*\\nEncontrei emails de remetentes que o workflow ainda não lê:\\n${linhas.join('\\n')}\\n\\nSe algum for alerta de vagas, avise para incluir na busca.` } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        11520,
+        3136
+      ],
+      "id": "cff9fd7b-6ca4-49cf-886b-2684b72178e0",
+      "name": "Remetentes novos"
+    },
+    {
+      "parameters": {
+        "chatId": "SEU_CHAT_ID_DO_TELEGRAM",
+        "text": "={{ $json.texto }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        11776,
+        3136
+      ],
+      "id": "22ec9100-8d5a-4af5-99a0-947c3892ae65",
+      "name": "Aviso remetente novo",
+      "webhookId": "2eb7492a-3e96-47ad-861b-77e6b3c44b09",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "**Vagas por Email v2** — lê os alertas de vagas do Gmail (LinkedIn, Glassdoor, Indeed), pontua com Groq e manda as compatíveis (nota ≥ 60) para o seu bot de Telegram.\n\n**Ativar:** botão Publish/Active. A fila e as vagas já vistas só ficam salvas em execução real; o teste manual processa só 5 vagas e não marca emails.\n\n**Backfill (uma vez):** com o workflow ativo, abra no navegador http://localhost:5678/webhook/vagas-email-backfill?dias=60  (ou ?inicio=2026/08/01&fim=2026/10/16). Analisa 50 vagas por execução; o resto fica na fila e sai nas execuções das 17h.\n\n**Se parar de funcionar:** com o app do Google em modo Teste, o acesso ao Gmail expira a cada 7 dias (o bot avisa). Reconecte a credencial Gmail.\n\n**Ajustes:** nota de corte, bônus e descontos em 'Code in JavaScript1'; limite diário e filtros de título em 'Extrair e enfileirar'; remetentes e janela de dias em 'Montar busca'.",
+        "height": 260,
+        "width": 760
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        10976,
+        2784
+      ],
+      "id": "a4b6d9ef-22fe-45c2-b630-b72ef7dc8fbd",
+      "name": "Nota"
+    },
+    {
+      "parameters": {
+        "operation": "markAsRead",
+        "messageId": "={{ $('IDs para marcar').item.json.messageId }}"
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        13088,
+        3888
+      ],
+      "id": "eccec2d0-efa4-4be7-a686-464c1459f400",
+      "name": "Marcar como lido",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "webhookId": "fadcb7de-9dc9-4cd0-a962-9d937817b130",
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Montar busca",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Buscar remetentes novos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Backfill": {
+      "main": [
+        [
+          {
+            "node": "Montar busca",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar busca": {
+      "main": [
+        [
+          {
+            "node": "Buscar emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar emails": {
+      "main": [
+        [
+          {
+            "node": "Extrair e enfileirar",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Aviso erro Gmail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrair e enfileirar": {
+      "main": [
+        [
+          {
+            "node": "Tem vaga?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Montar resumo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IDs para marcar": {
+      "main": [
+        [
+          {
+            "node": "Marcar processado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar resumo": {
+      "main": [
+        [
+          {
+            "node": "Resumo Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tem vaga?": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IDs para marcar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "IDs para marcar",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Abrir vaga",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Abrir vaga": {
+      "main": [
+        [
+          {
+            "node": "Montar texto",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar texto": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "IA respondeu?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IA respondeu?": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Basic LLM Chain reserva",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model reserva": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain reserva",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain reserva": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain1": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send a text message": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar remetentes novos": {
+      "main": [
+        [
+          {
+            "node": "Remetentes novos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Remetentes novos": {
+      "main": [
+        [
+          {
+            "node": "Aviso remetente novo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Marcar processado": {
+      "main": [
+        [
+          {
+            "node": "Marcar como lido",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timezone": "America/Sao_Paulo"
+  },
+  "meta": {},
+  "nodeGroups": [],
+  "tags": []
+}
